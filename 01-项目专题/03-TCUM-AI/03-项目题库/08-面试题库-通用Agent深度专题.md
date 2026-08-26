@@ -207,9 +207,9 @@ Anthropic ephemeral cache TTL=5min。长时间不操作后首个请求明显更�
 
 ---
 
-### 3. Codex（推测 + 部分公开）
+### 3. Codex（2026-08-26 本地官方开源 Harness 已可验证；云端策略仍有边界）
 
-OpenAI 家、走 Responses API / Chat Completions，**OpenAI cache 全自动**（≥1024 token / 5–10 min）。客户端能做的都是间接功夫。
+OpenAI 家、可使用 Responses API / Chat Completions；云端 prompt-cache 的具体命中/TTL 不应由本地仓库反推。当前 `openai/codex` 开源 runtime 已能直接验证其客户端侧的上下文状态、compact、AGENTS.md、Skill/MCP/Hook 与事件历史机制。
 
 #### 3.1 Responses API 的 `previous_response_id`
 
@@ -218,21 +218,21 @@ POST /v1/responses
 { "previous_response_id": "resp_xxx", "input": [{ new user turn only }] }
 ```
 
-服务端接续上下文——**客户端不用重发历史**，前缀稳定问题搬到服务端。
+服务端接续上下文可以避免客户端重发完整历史，但并不消除模型窗口与前缀稳定问题；Codex 还维护本地 Thread/Turn/Item history，不能只用这个 API 描述整个运行时。
 
 #### 3.2 System prompt 稳定化
 
-`AGENTS.md` + 内置指令 + 工具定义是磁盘固定文件；动态部分（CWD、shell、git branch）推测塞进 message 而非 system。
+`AGENTS.md` 按根目录到当前目录分层发现并装配；同时 runtime 使用带 kind/marker 的 contextual fragments。动态信息究竟在不同产品表面/模型请求中的精确摆放需以抓包或协议实现为准，不再写“推测塞进 message”。
 
 #### 3.3 Function calling 定义稳定
 
-OpenAI SDK 的 functions 数组 JSON 序列化属性顺序稳定。
+内置工具、MCP、Skill、Hook、Plugin 分层管理；稳定 schema 仍是 cache-friendly 原则，但不能把 JSON 序列化顺序当成 Codex 的完整工具稳定性策略。
 
 #### 3.4 局限
 
-- 自动缓存仅 ≥ 1024 token 前缀生效；
-- `cached_tokens` 有返回但 CLI 未透出；
-- compaction 策略未知。
+- 云端缓存阈值、TTL 和具体命中率属于服务端行为，应从官方 API 文档/实际 usage 核验；
+- 客户端并非没有预算能力：`context_window.rs` 跟踪 active context、auto-compact scope、hard cap、剩余预算与 fallback buffer；
+- 可公开验证的是本地 compact / token-budget 控制；云端最终摘要策略仍未知。
 
 ---
 
@@ -242,12 +242,12 @@ OpenAI SDK 的 functions 数组 JSON 序列化属性顺序稳定。
 |---|---|---|---|---|
 | provider cache | OpenAI 自动 | Anthropic 手动 | 多 provider（DeepSeek 自动主打） | ? |
 | 显式打断点 | 不需要 | 4 个 ephemeral | `cacheRetention` 由 adapter 决定 | ? |
-| 前缀稳定保证 | 依赖 Responses API 服务端接续 | 工具集编译期固定 | **架构级**：epoch header + canonical + deepFreeze + 字典序 + 事件重放 | 缺失 |
-| 命中率可观测 | 有 `cached_tokens` 但 CLI 不透出 | 有 usage 字段 | **一等公民**：`cacheReadTokens`/`cacheWriteTokens` 进投影 | 缺失 |
-| Compaction | 未知 | `/compact` 手动 | 三件套（压力检测 + 剪枝 + checkpoint） | ? |
+| 前缀稳定保证 | `AGENTS.md` 分层 + typed context；是否命中云端缓存须实际核验 | 工具集编译期固定 | **架构级**：epoch header + canonical + deepFreeze + 字典序 + 事件重放 | 缺失 |
+| 命中率可观测 | 有 usage/Thread 事件；云端 cache 指标暴露依产品/API 而定 | 有 usage 字段 | **一等公民**：`cacheReadTokens`/`cacheWriteTokens` 进投影 | 缺失 |
+| Compaction | 本地有 token budget 与 compact 控制；云端摘要细节未知 | `/compact` 手动 | 三件套（压力检测 + 剪枝 + checkpoint） | ? |
 | 贡献者纪律 | N/A | N/A | **README 强制声明 `KV Cache effect`**，CI 校验 | N/A |
-| 可扩展性 | 内置 | 内置 | 每层可替换插件 | ? |
-| 公开可验证 | 无 | 部分 | 全部源码 | 内部 |
+| 可扩展性 | Skill / MCP / Hook / Plugin / App Server；内核更受控 | 内置 | 每层可替换插件 | ? |
+| 公开可验证 | 本地 Harness 源码可验证，模型/云端策略不可见 | 部分 | 全部源码 | 内部 |
 
 ---
 
@@ -348,7 +348,7 @@ OpenAI SDK 的 functions 数组 JSON 序列化属性顺序稳定。
 **Q13. Sub-agent 的上下文继承 vs 隔离？**
 - Claude Code Task：**新起独立 context**，只回传 final result。优点隔离清晰，缺点父 agent 看不见细节。
 - dsh：**同一套 subagent 抽象，多种 backend**（`packages/subagent/*`）：`subagent-fork-in-process`（继承父会话）/`subagent-spawn-in-process`（干净起）/`subagent-acp`（跨进程 ACP 协议）/`subagent-claude-code`/`subagent-codex`/`subagent-dsh-sdk`——**同一个 `SubagentProvider` 接口**，容器化调度。fork 版继承有个精细边界：**seed 到最后一个 `turn/end`**（"the current tool-call turn is unbalanced and cannot be replayed as a valid child session"），避免用 in-flight turn 污染子会话。`[源码可验证：packages/subagent/subagent-fork-in-process/src/index.ts]`
-- Codex：Codex 内子 agent 不显式暴露。
+- Codex：**旧口径已过时**。本地官方 `openai/codex` 源码（2026-08-26）已有 Multi-Agent V2：区分 root/subagent role instruction、并发槽位、父子消息与任务回传；full-history fork 继承模型/推理配置也有显式边界。默认仍是 `explicit request only`，仅特定高 reasoning 配置允许 proactive 多 Agent，因此不能表述为“默认到处自动拆 agent”。详见 [Codex 源码对读](../05-演进与对比/12-Codex开源Agent源码解构与TCUM-AI对照.md#6-多-agentcodex-已经显式具备协作运行时但不等于所有任务都该拆)。
 
 ### 三、工具体系（Q14–Q19）
 
@@ -362,6 +362,7 @@ OpenAI SDK 的 functions 数组 JSON 序列化属性顺序稳定。
 
 **Q16. MCP 工具动态注册 vs 编译期固定？**
 - Claude Code：内置固定 + MCP 动态。
+- Codex：内置工具之外同时有本地 Skill、Plugin 和 MCP；App Server 对 Skill 根目录、文件变更失效、MCP server 启动状态与扩展 profile 都有运行时协议。工具能力并非只能“改核心再 fork”，但高风险动作仍受权限/审批边界约束。
 - dsh：全插件化，MCP tools 走 `packages/core/tools` 注册接口。
 - 权衡：动态灵活但字节稳定性差；dsh 通过字典序缓解。
 
@@ -404,7 +405,7 @@ OpenAI SDK 的 functions 数组 JSON 序列化属性顺序稳定。
 
 **Q24. Orchestrator-Worker vs Peer-to-Peer 多 agent 架构？**
 - Claude Code Task：Orchestrator 模式（主 agent 派单 sub agent）；
-- Codex：主要单 agent + Responses API 状态服务器；
+- Codex：单 Agent 仍是常态，但当前开源 runtime 已有 Multi-Agent V2；其 Thread/Turn/Item 也可由本地 thread store 持久化、resume/fork/replay，不能再简化成“只有 Responses API 状态服务器”。
 - dsh：**统一 subagent 抽象 + 7 种 backend**（`packages/subagent/*`）：`subagent` 定义 `SubagentProvider` 接口；backend 有 `subagent-fork-in-process`（fork 父会话）/`subagent-spawn-in-process`（干净起）/`subagent-acp`（跨进程 ACP 协议）/`subagent-claude-code`（把 CC 当 subagent）/`subagent-codex`（把 Codex 当 subagent）/`subagent-dsh-sdk`；工具侧有 `tool-subagent` + `tool-subagent-control` + `tool-subagent-report`。**能把外部 agent 当 subagent 用**是 dsh 独门。属于 Orchestrator 但插件可换 backend。`[源码可验证]`
 - 学术界：AutoGen 支持 Peer-to-Peer。
 - 权衡：Orchestrator 好控好观测；Peer-to-Peer 灵活但难调试。
@@ -412,13 +413,13 @@ OpenAI SDK 的 functions 数组 JSON 序列化属性顺序稳定。
 **Q25. 长程任务（跑几小时）如何保证不丢状态？**
 - dsh：**Session 是 append-only event log**，进程崩重启后能 100% 重放；另外有 **Goal 域**（`packages/goal/*` 四个包：`goal` 事件溯源 + CAS 变更、`goal-round-driver` 分轮调度、`tool-goal`、`command-goal`）专门追踪长程任务的分解与阻塞——**这才是 dsh 真正的长程任务原语**，不是单纯靠 session 恢复。`[源码可验证]`
 - Claude Code：`.claude/` 目录持久化，`--resume`；
-- Codex：Responses API 服务端保存。
+- Codex：既可与上游 Responses API 交互，也有本地 Thread/Turn/Item、rollout 与 thread-store；App Server 提供 `thread/resume`/`thread/fork`，持久化边界由客户端/运行环境配置决定。
 - 核心 pattern：**Event Sourcing**——所有状态是事件日志的纯函数。
 
 **Q26. Checkpoint / Resume 怎么实现？**
 - dsh：**双层持久化**——`packages/core/session` 定义事件模型；`packages/session/session-persistence` 是可替换 seam，默认 backend `session-persistence-jsonl`（append-only + Zstd 压缩），可切 `session-persistence-sqlite`；`session-checkpoint-policy` 定义每次 request 的 durability checkpoint 时机；重启后按 `request/header reason:'resume'` 事件明确标记恢复边界，任意点续跑。`[源码可验证]`
 - Claude Code：`--resume <session-id>` 从 `.claude/projects/*/history.jsonl`。
-- Codex：`previous_response_id`。
+- Codex：可通过服务端 response 接续，也有本地 `thread/resume`、`thread/fork` 和事件历史；实际选择应按产品表面和存储策略区分，不能把两种机制混成一个 `previous_response_id`。
 
 **Q27. Task 分解粒度：一个 Task 应该多大？**
 - Claude Code Task 官方建议：一个 Task 只做一件相对独立的探索（例如"找出所有 error handling 位置"）；
@@ -733,8 +734,8 @@ OpenAI SDK 的 functions 数组 JSON 序列化属性顺序稳定。
   3. 用户禁用了 compact 又不给切模型——**turn-stopping**，返回明确错误 `TurnEndReason=context_exhausted`，让用户手动决定。**永远不要静默丢消息**。
 
 **B7**：Codex 用 Responses API 服务端接续，是不是根本没有 compact 问题？
-- 强答：**有，但被 OpenAI 藏起来了**。`previous_response_id` 只是客户端不用重发历史，服务端仍要把所有历史喂给模型，同样受 model 的 max context 限制。区别在于：
-  - Codex 客户端：**看不见** context 用了多少（黑盒），无法主动 compact；
+- 强答：**有，但不能再把 Codex 当作纯黑盒**。服务端接续不会消灭模型上下文上限；当前开源 runtime 的 `context_window.rs` 会维护 active context、auto-compact 范围、full window hard cap、剩余预算和 fallback buffer，并有 compact/token-budget 事件。因此正确的比较是：
+  - Codex：拥有 runtime 级预算与压缩机制，具体产品界面暴露程度、云端策略和模型端自动压缩细节不应从客户端源码反推；
   - Claude Code / dsh 客户端：**看得见**（token-meter 一等公民指标），可主动优化。
   dsh 用户完全可以自己实现"Responses-API-like 服务端接续"——只需一个 stateless 代理保存日志——但**主动权在客户端**，这就是可观测性带来的架构选择自由。
 
@@ -749,7 +750,7 @@ OpenAI SDK 的 functions 数组 JSON 序列化属性顺序稳定。
   1. **LLM adapter**：`llm-deepseek` / `llm-pi-ai` / `llm-anthropic` 都是插件，切 provider = 换插件；
   2. **工具**：每个工具（bash / read / grep / todo）都是独立 npm 包，MCP 工具是运行时注册的插件；
   3. **系统能力**：compaction、token 计量、subagent、skills，甚至 system prompt 组装本身都是插件。
-  **反例**：Claude Code / Codex 的工具集和 LLM 绑死在核心里，加功能靠 fork。
+  **反例（需修正）**：Claude Code 与 Codex 的内置核心工具更产品化，但 Codex 已有 Skill、MCP、Hook、Plugin 和 App Server 扩展面；它不是 dsh 那种“所有内部子系统均可热挂卸”的全插件架构，却也不是“加能力只能 fork”。
 
 **C2**：底层框架叫什么？和 DI 容器（Spring / NestJS）什么区别？
 - 强答：**Cordis** ([docs/cordis-primer.zh.md](/Users/yaao/Documents/code/AI-agent/deepseek-harness/docs/cordis-primer.zh.md))——依赖注入 + 事件总线。区别：
@@ -795,7 +796,7 @@ OpenAI SDK 的 functions 数组 JSON 序列化属性顺序稳定。
   1. **启动开销**：每次挂载 fiber、resolve inject、type-check，冷启动比硬编码慢 5-10x；
   2. **类型系统复杂**：`ctx.tools` 类型要靠 TS 声明合并（declaration merging）动态扩展，出错难 debug；
   3. **调试链路长**：一个 tool 调用穿过 5 层 waterfall、3 个服务代理，栈追踪很深。
-  Claude Code / Codex 选择硬编码是**产品定位**——它们是**面向终端用户的应用**，不追求二次开发。dsh 定位是**Agent 平台**，让第三方能实现自己的 tool 集/policy/observer，插件化必不可少。这不是技术优劣，是场景选择。
+  Claude Code / Codex 的内核更强调稳定产品体验和受控扩展：Codex 将 Skill、MCP、Hook、Plugin、App Server 协议作为扩展面，而不是把每个核心子系统都暴露为可热挂卸插件。dsh 定位更接近可重组的 Agent 平台，二者是**扩展边界选择**而非技术优劣；不要再说 Codex“不追求二次开发”。
 
 #### 补充：从 HTTP 请求到 Session 落盘的一条完整链路
 
@@ -922,14 +923,14 @@ agent.ctx.on('agent/pre-step', listener)
   - **三个 Inbox 接口**区分插入时机：`followup()` → `next-turn`（组成下一个新 turn）｜`steer()` → `next-step` + 唤醒（当前 turn 中途插入）｜`inject()` → `next-step` + 不唤醒（高阶推理用：下次自然推理时带上）；
   - 已发出的 LLM 请求不打断（等 stream 完），但下一个 step 的 request 会带上 steering message；
   - `wakeDriver()` 在下一个推理边界处重新读 inbox：发现 fresh steering 就多跑一个 step；没有就 close turn。**没有专门的 `TurnEndReason=steering_change`**（早期文档推测错误），而是通过 inbox 拆分到 `next-turn` / `next-step` 两个队列自然区分。
-  - **对比**：Claude Code / Codex 没有对应的 API——Codex 虽然有基于 Responses API 的会话接续（`previous_response_id`），但那是"新 turn"而非"turn 中途插入"；想在 CC/Codex 里改方向只能 ESC 中断再重新输入，中断的成本是丢失当前 turn 的上下文推理。
+  - **对比（需限定版本）**：当前 Codex App Server 已公开 `turn/steer`，可以把新输入送入指定 thread 的运行时；其精确插入时机与 dsh inbox 不同，不能据此断言“只能 ESC 中断”。比较时应问：新指令是取消当前请求、下一个 step 生效，还是能安全改变正在执行的有副作用工具；后两者都必须配合状态机和幂等语义。
 
 ---
 
 ## 第二部分 · Agent 自进化专题
 
 > **这个话题目前业界只有 3 种典型形态**，从弱到强：
-> 1. **Claude Code / Codex：静态记忆文件**（CLAUDE.md、AGENTS.md）——启动加载，运行时不变；
+> 1. **Claude Code：以静态 `CLAUDE.md` 为主；Codex：`AGENTS.md` 是稳定项目指令，同时当前开源 runtime 已有从 rollout 异步抽取、再由隔离 consolidation Agent 串行聚合的 memory pipeline**。两者都不能简单概括为“只支持启动时静态文件”。
 > 2. **dsh：动态注入 + 记忆更新**——`agent.inject()` 让运行时新信息进入下一次请求；
 > 3. **dsh：动态 Cordis Plugin**（`cordis_define` / `cordis_run` / `cordis_inspect_self`）——**agent 在运行时"写代码给自己装能力"**，失败后自省诊断、修正、重试。这是目前最激进的自进化形态。
 > 三种都写。
@@ -1085,7 +1086,7 @@ agent.inject({
 
 agent 一次会话中定义了一个动态 Plugin，运行、自省、修正——完整闭环在 session 事件流中可见。这个 e2e 测试就是**"agent 给自己长出一个新工具"** 的可复现证据。
 
-**对比 Claude Code / Codex**：完全没有等价能力。它们的工具集编译期固定，MCP 也只能在启动前配置，不能运行时 agent 主动"我需要一个新工具，我自己写"。
+**对比 Claude Code / Codex**：当前公开 Codex 有 Skill/MCP/Hook/Plugin 的加载与变更发现能力，但没有看到 dsh 这种“主 Agent 在一轮里自主生成、安装、激活任意新 runtime Plugin”的等价闭环。差别应表述为**自我扩展的授权与动态性更弱/更受控**，而不是“工具集编译期固定”。
 
 ---
 
