@@ -145,7 +145,7 @@
 
 ## Q3. 上下文超限如何处理？压缩算法是什么？
 
-**为什么会有这个问题**：早期告警诊断专家上线后，线上反复出一个官接官手的现象：**连续十几轮正常，突然某一轮 `400 ContextWindowExceededError` 直接中断，上一轮 token 明显低于阈值**。复盘发现是一个盲区：eino 的 `ToolsNode` 对一轮 N 个 `tool_calls` 是 **并发执行 + `wg.Wait()` 一次性全返回**，所以 token 不是渐增而是"从 18k 直接跳到 128k"，整个"安全区"被跳过；而且这一批全是**未读 tool**，summarization 无 elidable 内容可剔除，直接就把超限 messages 发出去。所以需要一套**三层防御**：入口治理（工具结果别那么大）、周期性压缩（历史瘦身）、**撞墙自愈兜底**（`AdaptiveContextRetry` 就是被这个现象逼出来的，文件头注释里把这个复盘写进了代码）。
+**为什么会有这个问题**：早期告警诊断专家上线后出现过一个棘手现象：连续多轮正常，某一轮却因 `400 ContextWindowExceededError` 直接中断。复盘发现，eino 的 `ToolsNode` 对一轮多个 `tool_calls` 会并发执行并在 `wg.Wait()` 后一次性返回，因此 token 不是线性增长，而可能被一批大工具结果直接推过安全区；这批结果又都是模型尚未读过的新内容，周期性 summarization 没有旧内容可优先剔除。于是需要三层防御：入口治理、周期性压缩和撞墙后的自适应重试。具体 token 跳变量应以 trace 为证据，不把示例数值当成固定规律。
 
 **回答思路**：这是长会话 Agent 的生死线。要回答三层：**入口治理**（工具结果别让它进来那么大）、**周期性压缩**（历史怎么瘦身）、**兜底**（真撞上限怎么办）。三层缺一层就会出现"某类场景必挂"。
 
@@ -267,7 +267,7 @@
 
 ## Q6. 循环中的流式处理如何做？工具能否边生成边执行？
 
-**为什么会有这个问题**：本质是两个用户体验。第一是 **TTFT**（首 token 到达时间）：早期模型回答前用户盯着白屏 5-10s、以为卒了——现在 SSE 流式先丢出推理内容，体感完全不同。第二是 **执行流式化**：早期我们发现一个现象——告警诊断一轮里模型同时要调 5 个工具，但模型“说完 5 个工具名字”要 3-4s，执行工具又得等它全说完才能开始Ｌ——**这 3-4s 本可以并行拿去跑工具了**。CC 的 `StreamingToolExecutor` 就是为这个优化而生。所以需要回答：流式到什么粒度（字符/tool call 粒度）、并行能不能与生成重叠、**流式中断能不能优雅处理**（后一点往往被忽略，但断线后能不能恢复直接影响体验上限）。
+**为什么会有这个问题**：这里包含两类体验。第一是 **TTFT**（首 token 到达时间）：SSE 可以尽早返回可展示内容，避免用户长时间面对空白页面。第二是 **执行流式化**：当模型同时生成多个工具调用时，如果必须等所有 tool call 完整生成后才开始执行，就会浪费本可用于并行执行的时间。需要进一步回答：流式做到字符还是 tool call 粒度、工具执行能否与生成重叠，以及流式中断后如何恢复。具体秒数必须由 trace 证明，不应作为固定项目指标。
 
 **回答思路**：流式有两个层次：**输出流式**（用户体验，降 TTFT）和**执行流式**（性能，把工具执行与模型生成重叠）。后者是纯工程优化，收益取决于"生成耗时 vs 工具耗时"的比例。
 
@@ -531,9 +531,7 @@
 
 ## Q13. 多 Agent 如何编排？
 
-## Q13. 多 Agent 如何编排？
-
-**为什么会有这个问题**：早期想把所有能力塞进一个大 Agent——告警、指标、看板、CMDB、天巡、变更Ｌ——结果看到三个官接官手的现象：**system prompt 破 40k（工具描述 25k+）、KV Cache 命中率降到 20% 以下、选错工具频发**（名字相似的彼此干扰）。而且一个大 Agent 同时处理告警和变更时，上下文互相污染，“刚才排查告警看到的变更信息”会被带到下一个无关问题。后来拆到 15 个专家 Agent，每个只持自己领域的 10-20 个工具 + 自己的 SystemPrompt。但新问题又来了：**并发控制**——两个子 Agent 同时对同一个实例变更（真实风险）；**上下文共享 vs 隔离**——子 Agent 需要前因后果时不能完全空白启动。所以需要回答：拆不拆（token 成本与路由准确率双重逼迫）、怎么拆（Deep vs Supervisor）、并发怎么控（写操作不能无限并发）。
+**为什么会有这个问题**：把告警、指标、看板、CMDB、天巡和变更全部塞进一个大 Agent，会带来三个棘手问题：system prompt 和工具描述持续膨胀、相似工具互相干扰、不同任务的上下文相互污染。按领域拆分专家后，又会出现并发控制与上下文共享问题：两个子 Agent 不能同时修改同一资源，但子 Agent 也不能在完全缺少前因后果的情况下启动。因此要回答三个层次：为什么拆、按什么边界拆、读写任务如何控制并发。Agent 和工具的具体数量以运行配置快照为准。
 
 **回答思路**：单 Agent 的天花板是"工具太多选不准+ 上下文太长记不住"。多 Agent 的编排模式决定三件事：**任务如何分解、并发如何控制、结果如何汇总**。其中并发控制在有写操作的场景是**安全问题**而非性能问题。
 
@@ -579,8 +577,6 @@
 
 ## Q14. 意图路由如何做？准确率如何保证？
 
-## Q14. 意图路由如何做？准确率如何保证？
-
 **为什么会有这个问题**：一个看似巧妙实则困扰的难题——**路由错了，表现是“Agent 答不对”**，但你无法区分到底是路由选错了专家（告警问题丢给了 PromQL 专家）还是专家自己能力不够（PromQL 专家自己写错了）。日志里也看不出——因为模型后面“头头是道”地把错误归结成了“信息不够”。而且早期直接把 15 个专家描述全部塞进 supervisor 的 prompt——**千 token 级别的常驻开销 + 选择无置信度**（模型不会告诉你它“不确定”选哪个，只会硬选）。所以需要回答：能不能度量路由准确率（否则无法优化）、能不能先规则硬匹再 LLM（降成本）、置信度低时能不能反问（不乱猜）。
 
 **回答思路**：路由是多 Agent 的第一道关。路由错了后面全错，但**路由错误的表现是"Agent 答不对"，极难归因**。所以路由必须**可度量**，否则无法优化。
@@ -617,9 +613,7 @@
 
 ## Q15. 子 Agent 上下文如何隔离？
 
-## Q15. 子 Agent 上下文如何隔离？
-
-**为什么会有这个问题**：真实碰到的两难——**完全隔离**：告警专家已经查到“告警时间 15:30、实例 ID xxx”，现在派发到指标专家去查该实例那时的指标Ｌ——如果隔离了子 Agent 只收到一句 description，它不知道时间/实例都得重新问一遍；**完全共享**：把前面 20 轮历史全传给子 AgentＬ——**子 Agent 看了一堆不相关的变更、CMDB 查询后“思路被带偏”**，而且 token 成本羻增。后来发现一个隐蔽成本动机：prompt cache 对"前缀完全一致"极敏感Ｌ——共享完整历史能命中 cache，重新写 description 直接估不下。所以需要回答：隔离粒度能不能分档（完全隔离、部分继承、完全继承），prompt cache 能不能共享前缀（成本优化）。
+**为什么会有这个问题**：这里存在两难。完全隔离时，告警专家已经得到的告警时间和实例 ID 无法自动交给指标专家，后者必须重新查询；完全共享时，大量无关历史会干扰子 Agent，并显著增加 token 成本。另一个约束是 prompt cache 依赖稳定前缀，重新组织整段上下文可能失去缓存收益。因此上下文继承应分档：只传结构化任务包、传相关历史切片，或在确有必要时共享完整历史；每档都应记录 token、缓存命中和任务正确率。
 
 **回答思路**：隔离带来干净和并行，但也带来信息丢失。**关键权衡：子 Agent 需要多少前因后果？** 而prompt cache 又给"共享前缀"带来了额外的成本动机。
 
@@ -652,9 +646,7 @@
 
 ## Q16. A2A 协议如何实现？稳定性如何？
 
-## Q16. A2A 协议如何实现？稳定性如何？
-
-**为什么会有这个问题**：tcum-ai 有15 个 Agent、多个服务进程分布在不同机器，sre_expert 甚至在外部团队。早期一个真实 case：tcum_tcs_error_debug_expert 部署在独立机器 21.117.141.204，一次探测时他的提问需要 90s+ “内部思考不输出中间 chunk”，但 A2A 默认 `idleTimeout=60s`Ｌ——**本来子 Agent 在思考重要问题，却被“误判为卡死”强斩**。另一个痛点是 Langfuse trace：跨了一个服务调用，“一条完整链路”断成两段，排障时得在两个 trace 里来回切。所以需要回答：“在忙”和“卡死”能不能区分（业务心跳 progress）、断线后中间结果能不能保（快照）、跨进程 trace 能不能串（traceparent 透传）。
+**为什么会有这个问题**：tcum-ai 的多个 Agent 和服务可能跨进程部署，部分子 Agent 在长时间推理时不输出中间 chunk；如果 A2A 只用固定 idle timeout 判断存活，就可能把“仍在计算”误判为“已经卡死”。跨服务后，Langfuse trace 还可能被拆成多段。需要回答三个问题：如何用业务心跳区分忙与卡死、断线后如何保存中间状态、如何透传 `traceparent` 串起跨进程链路。具体 Agent 数量、机器地址和超时时间必须以配置或 trace 为准，不在面试稿中暴露内部地址。
 
 **回答思路**：跨进程 Agent 通信的三个稳定性问题：**超时判定**（"在忙"和"卡死"怎么区分）、**断线恢复**（中间结果保不保）、**可观测性**（trace 能不能跨进程串起来）。
 
@@ -686,9 +678,7 @@
 
 ## Q17. MCP 的 Client / Provider 双向能力实现如何？
 
-## Q17. MCP 的 Client / Provider 双向能力实现如何？
-
-**为什么会有这个问题**：面临一个拉栏选择——**内部已有 128 个工具散在 6 个服务进程，不同项目团队（具名平台/天巡/Grafana 团队）都想接**。两个选项：一是每家自己写 SDK（重复造轮、升级要推多方），二是担任 MCP Provider（统一协议、完全解耦）。选了后者，但自己也需要 Consumer 能力去拉外部 MCP（腾讯云公共 MCP、三方 SaaS）Ｌ——难题就来了：演变后对内部 tcum-ai 自身也同时是 Consumer 和 Provider。所以需要回答：连接管理（128 个连接不能全卡在 stdout）、鉴权（不同外部 MCP 鉴权方式各异）、契约稳定性（Provider 方不能随意改 tool schema）。
+**为什么会有这个问题**：当工具分散在多个服务、又需要被不同团队复用时，每家维护一套 SDK 会造成重复实现和升级困难；以 MCP Provider 暴露统一协议可以降低耦合。同时，tcum-ai 还需要作为 Consumer 接入外部 MCP，因此连接管理、鉴权和契约兼容都变成双向问题。工具和服务数量应从当前配置生成清单，不把一次统计写成永久常量。
 
 **回答思路**：MCP 是 2024 末以来的事实标准。作为 Consumer 关注**连接管理与鉴权**；作为 Provider 关注**契约稳定性**。双向都做的项目很少。
 
@@ -734,9 +724,7 @@
 
 ## Q18. RAG 检索质量如何保证？
 
-## Q18. RAG 检索质量如何保证？
-
-**为什么会有这个问题**：一个早就知道但迟迟没修的技术债——监控元数据检索里 **BM25 与 kNN 得分直接相加**（RRF 需付费 license 用不了）Ｌ但 BM25 无上界、cosine 归一化 0-1Ｌ——**向量分被量纲淹没**，实际排序靠 BM25 主导，向量那部分基本白做。而且 `ScoreThreshold` 未设 → **永远返回满 TopK**，不相关的 chunk 也会一同返回堆到 prompt 里。更让人头疼的是【静默失效】：无人周期性验证、无回归集Ｌ——**只有用户具体说“你们搜不到某个指标”时才知道坏了，实际已经坏了好久**。所以需要回答：四环（召回/排序/阈值/一致性）都得回答，任一环静默失效都会拖垮全局。
+**为什么会有这个问题**：监控元数据检索里 BM25 与 kNN 分数直接相加，但两者量纲不同，BM25 可能淹没归一化后的向量分；`ScoreThreshold` 未配置时还会固定返回 TopK，把不相关候选一起放进 prompt。更隐蔽的问题是缺少周期回归集，检索退化往往只能靠用户反馈发现。因此评审 RAG 不能只看“用了混合检索”，而要分别验证召回、融合排序、阈值和索引一致性。
 
 **回答思路**：RAG 的效果由四环决定：**召回（能不能找到）、排序（相关的在不在前面）、阈值（不相关的有没有被挡住）、一致性（索引与查询用同一个向量空间吗）**。任一环坏了整体失效，而且**大多是静默失效**。
 
@@ -750,7 +738,7 @@
 **差异本质**：**这一问上TCUM 与另三家不可直接对比**——CC/Codex 是编码 Agent，语料是代码（结构化、可精确匹配），用 grep 优于向量；TCUM 面对的是"数千个监控指标的自然语言描述"，**必须靠语义检索**。所以 TCUM 在这块的技术债是**独有的、也是必须自己解决的**。
 
 **TCUM 亮点**（完整链路详见 [`05-场景篇` §8](../02-场景案例/05-场景篇-总览与监控域.md)）：
-1. **两套体系分工合理**：监控元数据是"一条一档"的结构化检索（自建 ES8 可控），通用文档走 PaaS（不重复造轮子）；
+1. **两套体系分工合理**：监控元数据是“一条指标元数据对应一个文档”的结构化检索（自建 ES8 可控），通用文档走 PaaS（不重复造轮子）；
 2. **三个 embedding provider 可切换**，有工程灵活性；三个索引**同构复用**同一套 indexer/retriever/embedder，新增知识域成本 = 一个 `meta_service.go`；
 3. ⭐**双路 query + 交替穿插的位次融合**（`tool_find_metrics.go:107-160`）：`FindMetrics` **强制要求两个 query 参数** —— `LLMRewrittenQuery`（模型提炼的指标描述）与 `Query`（用户原文全文，schema 里明确要求"全部传入"），各检索 20 条后**交替穿插按 `MetricFullName` 去重**。动机很扎实：只用改写会丢产品/地域线索，只用原文则噪音稀释向量；而两路分数**不可比**（不同 query 打出的分不在同一尺度），所以**按位次融合而不是按分数排序**——**这本质上是 RRF 的极简实现，在 ES商业版 RRF 不可用的约束下拿到了融合的主要收益**；
 4. **语料质量做成业务可运营的资产**：灌库时每层描述按 **`ai_description > description > name`** 三级优先级取值，`AiDescription` 是后端专门为 AI 维护的字段——**让最懂指标的人去写"给 AI 看的描述"**，而不是让算法侧猜；
@@ -787,15 +775,13 @@
 
 ## Q19. 知识如何切分、导入与更新？
 
-## Q19. 知识如何切分、导入与更新？
-
-**为什么会有这个问题**：一个真实发生的故障——某个产品的告警处理流程变了（旧方案已废弃），**但知识库里旧文档还在，Agent 根据旧文档引导用户去看一个已下线的看板**——用户白跑了一趟不知道怎么回事。而且 chunk 切多了会丢字段上下文（切到表格中间），切少了单个 chunk 又破预算。又同时，“含弃”一个 chunk 需要手工去库里删，**与文档源文件无关联**Ｌ——文档删了 chunk 还在。所以需要回答：切分能不能保表格/代码块完整（不丢上下文），**失效能不能自动（旧文档会不会按已废弃方案引导故障处理，这在运维场景是真实风险）**。
+**为什么会有这个问题**：产品告警流程变更后，如果知识库里的旧文档仍然有效，Agent 可能继续引导用户访问已下线的看板。切分过细还会破坏表格或字段上下文，切分过粗又会超出预算；如果 chunk 与源文件没有版本和删除关系，废弃内容只能人工清理。因此需要同时设计结构感知切分、来源版本、失效时间和删除传播。
 
 **回答思路**：切分决定检索片段是否可用；**失效机制决定会不会"按已废弃的方案处理故障"**——后者在运维场景是真实风险。
 
 | | 做法 |
 |---|---|
-| **TCUM-AI** | **体系 A 不存在切分**：`MetricMetaToDocument()`（`meta_service.go:321`）把**整条指标元数据 JSON 序列化后作为一个文档**，`doc.ID = "{stack}:{type}:info:{metric}"`。**这是合理的**——元数据检索天然"一条一档"，不是长文检索，没有 chunk size/overlap 概念。**体系 B** 走 trag：`CreateCollection`/`UpsertDocuments`/`DeleteDocuments`/`ImportFile`/`GetImportState`/`GetCollectionMeta`，**切分由 trag 侧负责（黑盒）**。Embedder 工厂：`cloud_hunyuan` / `venus_proxy_api`（`DefaultTimeoutSeconds=60`）/ `openai` |
+| **TCUM-AI** | **体系 A 不存在切分**：`MetricMetaToDocument()`（`meta_service.go:321`）把**整条指标元数据 JSON 序列化后作为一个文档**，`doc.ID = "{stack}:{type}:info:{metric}"`。**这是合理的**——元数据检索天然是一条指标元数据对应一个文档，不是长文检索，没有 chunk size/overlap 概念。**体系 B** 走 trag：`CreateCollection`/`UpsertDocuments`/`DeleteDocuments`/`ImportFile`/`GetImportState`/`GetCollectionMeta`，**切分由 trag 侧负责（黑盒）**。Embedder 工厂：`cloud_hunyuan` / `venus_proxy_api`（`DefaultTimeoutSeconds=60`）/ `openai` |
 | **CC / Codex** | 无独立知识库导入流程（代码即知识源，天然"实时"） |
 | **OpenClaw** | ClawHub 插件/技能分发 + 策展；知识库导入未展开（**未证实**） |
 
@@ -815,8 +801,6 @@
 - **O19.3（低成本高价值）** **导入后召回自检**：每批导入后抽样，用文档自身标题作为 query 检索，验证能否命中自己；命中率低于阈值则告警。
 
 ---
-
-## Q20. "三层记忆"具体是什么？如何召回与淘汰？
 
 ## Q20. "三层记忆"具体是什么？如何召回与淘汰？
 
@@ -867,9 +851,7 @@
 
 ## Q21. 会话如何持久化与恢复？
 
-## Q21. 会话如何持久化与恢复？
-
-**为什么会有这个问题**：就在最近的一个排查里撞到——长任务跑超过 10 分钟后 trpc 的整体 deadline 到了 SSE 被杀，用户看到【error】重新发一条Ｌ——**上一轮已经跑了一半的 assistant 内容要不要接上、已执行的 tool 能不能不重跑**Ｌ——发现能回答“接上历史上下文”但无法回答“从断点续跑”。另一个 case 是同一个会话多端同时操作（用户在 web 发了一条优能已发完想到手机又重发一遍）Ｌ——**两条消息交错写入，模型看到一个错乱的历史**。而且事后想重现当时的决策又发现——日志里只有消息、没有完整事件流。所以需要回答：**并发写会不会互相覆盖、断线能不能续、事后能不能重放当时的决策**。
+**为什么会有这个问题**：长任务遇到整体 deadline 或 SSE 断线后，仅仅把历史消息重新交给模型，并不能回答两个关键问题：已经执行的工具是否需要重跑、半途生成的结果如何从断点继续。多端同时向同一会话写入还可能造成消息交错。若日志只保存最终消息而没有完整事件流，事后也无法重放当时的决策。因此必须明确并发写入、断点恢复和事件审计三类语义；具体超时时间以部署配置为准。
 
 **回答思路**：三个问题：**并发写会不会互相覆盖、断线能不能续、事后能不能重放当时的决策**。
 
@@ -923,9 +905,7 @@
 
 ## Q22. 如何控制幻觉？
 
-## Q22. 如何控制幻觉？
-
-**为什么会有这个问题**：八个字概括——**"看似有据，实则还是编"**。最典型的一个同事反馈：告警专家回答“本次一共 47 条告警，其中 32 条集中在 CVM 产品”Ｌ——实际它只抓了 20 条（已截断），“47”是它自己估的。另一个现象是导致 memory 里PromQL 模板——`FindMetrics` 返回 15 个指标Ｌ但模型下一行直接编了一个不在列表里的 `container_memory_working_set_bytes`Ｌ——因为它以前在别处学过这个名字。而 `BuildTCUMDashboard.expr` 完全自由文本、不校验，**模型能先调 `FindMetrics` 但也能不调**。所以需要回答：输入侧能不能不喂噪音（RAG 阈值、截断 marker）、输出侧能不能强制溯源（工具参数白名单、“不在列表里直接拒”），而且**后者在 tcum-ai 至今没做**。
+**为什么会有这个问题**：可以概括为“看似有据，实则仍可能编造”。当工具结果已经截断时，模型可能把局部样本外推成全量统计；`FindMetrics` 返回候选指标后，模型也可能使用一个不在候选列表中的常见指标名。`BuildTCUMDashboard.expr` 是自由文本，如果生成链路没有强制校验，调用过检索工具也不代表最终表达式受其约束。因此输入侧要标明截断和召回边界，输出侧要对指标白名单、PromQL parser 和工具证据做确定性校验。
 
 **回答思路**：Agent 的幻觉比纯 LLM 更危险——因为它有工具，**看起来"有数据支撑"，实际可能是把不相关的检索结果编成了结论**。控制要从"输入侧（别喂噪音）"和"输出侧（强制溯源）"两头做。
 
@@ -968,8 +948,6 @@
 # 五、安全与权限（Q23~Q25）
 
 > **对照通用视角**（详见 [08](./08-面试题库-通用Agent深度专题.md) 二部分 Q45~Q47）：Prompt injection 防御的三层法（输入侧过滤 / 系统提示强化 / 输出侧校验）、敏感操作的 confirm 流程（HITL 断点）、Secrets 泄漏防御（.env 通配符过滤 + 白名单目录）。
-
-## Q23. 工具执行有权限控制吗？危险操作如何拦截？
 
 ## Q23. 工具执行有权限控制吗？危险操作如何拦截？
 
@@ -1036,9 +1014,7 @@ TCUM 现在两个维度**都缺**：沙箱强度未确认（技术边界不清�
 
 ## Q24. 有沙箱隔离吗？
 
-## Q24. 有沙箱隔离吗？
-
-**为什么会有这个问题**：因为告警汇总/SLO 分析需要 pandas 聚类，早期想了三个方案：一是直接让模型估算——已验证不行（长数组聚类 LLM 必错）；二是 Provider 侧写专用聚类工具Ｌ——需求变化快、非典型交互式数据处理；三是给模型一个 Python 沙箱，但风险极大——**官机失控、写文件、发网络请求、启动子进程**。而且内网环境下“发一个 HTTP 请求”可以直接变成跳板攻击金融/当丁/OA 内网服务。最终选了方案三 + 完整隔离，**但当时争论最多的就是网络处理——默认断网接不到内部 API、默认通网又变跳板**。所以需要回答：进程隔离、文件系统隔离、**网络出口**（内网场景最重要）、资源配额。
+**为什么会有这个问题**：告警汇总和 SLO 分析可能需要用 pandas 做聚类或统计。直接让模型估算长数组不可靠，为每种需求都在 Provider 侧开发专用工具又缺少灵活性；给模型 Python 沙箱则会引入宿主机、文件、网络和子进程风险。在内网环境中，一个不受控 HTTP 请求还可能把沙箱变成访问内部系统的跳板。因此必须同时回答进程隔离、文件系统、网络出口和资源配额，不能只说“用了容器”。
 
 **回答思路**：给模型一个 shell 是能力的巨大跃升，也是风险的巨大跃升。沙箱要回答四问：**进程隔离、文件系统边界、网络出口、资源配额**。**网络出口最容易被忽略，但在企业内网环境后果最严重**（内网跳板）。
 
@@ -1160,209 +1136,125 @@ TCUM 现在两个维度**都缺**：沙箱强度未确认（技术边界不清�
 
 ## Q27. 有评测体系吗？
 
-**为什么会有这个问题**：自评的 P0 短板——**每次改 prompt 都是"线上看感觉"**。一个典型场景：改了 promql_expert 的 SystemPrompt 想提升 label 推断准确率，本产品的测试 20 个问题似乎好了，但向量相似的“变更分析”场景下面麻团一片，一周后才开很多不相关的投诉都回到了这次修改。没有回归集 = 没有改动信心 = 不敢改 prompt = **Agent 能力停滞**。而这个问题不比传统前后端——后者都能写单元测试卡报错，前者本质概率性、写“当前路由到 PromQL 专家”这种硬断言无意义。所以需要回答：能不能先有黑盒任务集（“这个问题应该能得到 xxx”），能不能建 CI 果时自动跑，能不能不致于一改就卡住（量化级、pass@k）。
+<a id="q27-eval-suite"></a>
 
-**回答思路**：Agent 的行为是概率性的，**任何改动（改 prompt、换模型、调 RAG 参数）的效果都不可能靠"感觉"判断**。评测集是 Agent 工程与"调prompt 玄学"的分界线。
+**回答原则**：不能再回答“完全没有评测”，也不能回答“已经有成熟质量门禁”。准确定位是：**已落地一个以 Skill 为中心的离线 Eval Runner，完成了真实执行、Trace 留存、规则/custom 评分和异步聚合；但数据集治理、可复现环境、Artifact 真值、重复试验、Judge 校准和 CI 准入尚未补齐。**
 
-| | 做法 |
-|---|---|
-| **TCUM-AI** | ✅ **已落地独立的评测子系统 `eval_suite`**（独立服务进程 `cmd/server/eval_suite`、独立 controller `interfaceadapter/controller/eval_suite`、独立业务域 `usercases/eval_suite`）——包含 6 张表（`eval_suite` / `eval_case` / `eval_run` / `eval_trial` / `eval_scheduler_task` / `eval_task_lock`）、5 个内置量化 scorer（`tool_sequence_match` LCS / `keyword_match` must+forbidden / `token_cost` 平滑衰减 / `duration` 平滑衰减 / `output_schema` 字段命中）+ `custom` 走 AGUI 调 scorer_skill、加权聚合公式 `Σ(分×weight)/Σweight`、`pkg/scheduler` 异步调度。同时保留了单元测试（`token_counter_test.go` / `summarization_handler_test.go` / `adaptive_context_retry_test.go` 等）覆盖机制正确性。<br/>⚠️ **但对比设计文档 v2.0（iwiki 4025917312）实际发生了一次架构重构**：Revision 快照/扣分制/pass_rate/completeness LLM Judge/trial_count 重复执行 **全部废弃**（`init.go` 里 `DropTable("eval_suite_revisions")` + `DropTable("eval_scores")` + drop 一堆列即证据），改为"suite_code+version 联合唯一键 + case 独立表 + 量化加权 + 外部 AGUI SSE 专用评测 agent"。这个演进本身就是我最想在面试讲的一段——**"从 LLM Judge 扣分制 → 规则型量化"背后是评测可信度的取舍** |
-| **CC** |书中未展开评测细节，但有完整的错误分类/回归意识；Anthropic 内部有 SWE-bench 等基准 |
-| **Codex** | OpenAI 用 **SWE-bench 等公开基准**衡量 Codex 模型能力；`AGENTS.md` 里常写"改完必须跑测试"——**把评测下沉到用户项目的测试套件**，这是编码Agent 的天然优势 |
-| **OpenClaw** | 有 **"渠道 QA"** 章节 +发布与 CI；插件市场有策展/信任审核。评测细节未展开（**未证实**） |
+### 30 秒回答
 
-**差异本质（这是 TCUM 最尴尬也最需要正视的一点）**：
+> *“有，但目前是可工作的离线评测雏形，还不是发布准入系统。我们把 Suite/Case 拆开，每个 Case 创建 Trial，经 scheduler 调外部 AG-UI 专用 Agent 真正运行被测 Skill，从 SSE 收集最终文本、工具序列、reasoning、耗时和原始事件。内置 5 个规则型 scorer，再允许 custom scorer skill 做领域语义评分，最后按非 NA 维度加权聚合。它解决了‘能跑、能留证据、能看维度分’；当前主要欠环境与版本快照、结构化 ToolCall/Artifact 判定、同 Case 多次试验、Judge 校准以及 PR 自动门禁。”*
 
-> **编码 Agent 的评测是"免费"的**——代码能不能编译、测试能不能过，程序自己会告诉你。**运维 Agent 的评测是"昂贵"的**——"这个告警分析对不对"需要专家判断。
+### 2 分钟实现回答
 
-所以 Codex/CC 可以靠"跑测试"闭环，TCUM 必须**自建评测集**。这不是可选项，因为：
-1. 改 prompt / 换模型 / 调 RAG 参数全靠主观感觉；
-2. 今天修好的 case 明天可能又坏，且**无人知晓**；
-3. **对外宣称的准确率无数据支撑**——"告警分析准确率 X%"若无评测集，任何数字都站不住脚；
-4. **模型升级不敢做**——没有基准，换模型就是赌博。
+```text
+TriggerRun
+  → 读取 Suite 与 Case
+  → 每个 Case 创建 1 条 Trial + 一次性 SchedulerTask
+  → EvalTrialExecutor 解析 Skill ID、模型和环境变量
+  → POST skill_evaluation_agent
+  → 消费 AG-UI SSE
+  → TrialTrace{TaskResult, ActualTools, ReasoningText, DurationMs, DialogTrace}
+  → 5 个内置 scorer + custom scorer agent
+  → 非 NA 维度加权聚合
+  → Trial 落库
+  → 全部 Trial 终态后聚合 Run
+```
 
-**TCUM 亮点**：单元测试覆盖了核心机制（token counter、summarization、adaptive retry、sandbox），说明**对"机制正确性"有测试意识**——缺的是"效果正确性"。
+这里有两个常被追问的边界：
 
-**解决思路（这是 P0，仅次于权限）**：
+- **执行轨迹来自 AG-UI SSE，不是从 Langfuse 查询回来。** Langfuse 在正常 Agent 链路中承担观测；当前 Eval Runner 直接消费 `TEXT_MESSAGE_CHUNK`、`TOOL_CALL_CHUNK`、`REASONING_MESSAGE_CHUNK`、`RUN_STARTED/RUN_FINISHED` 等事件构造 Trace。
+- 当前真正实现的是 `skill_direct` 和 `baseline_skill_compare`；`model_eval`、`agent_eval` 只有枚举/占位，不能说成已支持。
 
-**O27.1分层评测集**：
+### 当前代码事实卡
 
-| 层 | 规模 | 内容 | 判定方式 | 优先级 |
-|---|---|---|---|---|
-| **单元级** | 200+ | 工具选择正确性、参数正确性 | 规则断言 | P1 |
-| **路由级** | 200+ | 问题 → 正确 Agent/域 | 精确匹配 | **P0** |
-| **RAG 级** | 300+ | query → 期望命中 doc | Recall@K / MRR | **P0** |
-| **结构化生成级** | 150+ | PromQL/InfluxQL/Grafana JSON/巡检项 | **执行验证自动判定** | **P0（最容易做）** |
-| **端到端** | 100+ | 真实运维问题 → 期望结论要点 | LLM-as-judge + 人工抽检 | P1 |
-| **安全级** | 50+ | Prompt 注入、越权尝试 | **必须全部拦截** | **P0** |
+| 维度 | 当前实现 | 面试边界 |
+| --- | --- | --- |
+| 服务形态 | 独立 `cmd/server/eval_suite`、controller、`usercases/eval_suite` 业务域 | 外部 AG-UI endpoint 被硬编码；“专用 endpoint”不等于源码能证明物理集群隔离 |
+| 数据模型 | Suite、Case、Run、Trial、SchedulerTask、TaskLock 6 类持久化实体 | 还没有 DatasetVersion、RunManifest、Artifact 一等实体 |
+| 执行次数 | 1 Case = 1 Trial | 没有 `trial_count=N`、方差、置信区间或 pass@k |
+| 执行场景 | `skill_direct`、`baseline_skill_compare` | baseline 对比不是通用 Agent A/B 实验 |
+| Trace | 最终文本、工具名序列、reasoning、耗时、原始 AG-UI 事件 | 工具参数/结果没有形成稳定结构化契约 |
+| 评分 | 5 个内置规则 scorer + custom scorer skill | custom Judge 尚未系统校准 |
+| 聚合 | `Σ(score×weight)/Σweight`，NA 不进分母 | 单一平均分无法表达 blocker、安全失败和切片退化 |
+| 调度 | `pkg/scheduler` + DB lock 异步执行 | 没有 PR/MR webhook 自动触发 |
 
-**为什么"结构化生成级"应该最先做**：PromQL/InfluxQL 的正确性**可以自动判定**（跑一遍看语法通不通、结果是否符合预期语义），Grafana JSON 可以调 Grafana API 试导入，巡检项可以 dry-run。**这一层是"运维 Agent 里的 SWE-bench"——判定免费、反馈即时、可进 CI**。做完这一层就能支撑"换模型/改 prompt 敢不敢上"的决策。
+### 五个内置 scorer 在证明什么
 
-**数据来源现成**：线上真实会话（Langfuse 里都有）+ 历史故障复盘 + 值班工单 + 各 Agent 的 `query_examples`。
+| Scorer | 真实算法 | 能证明 | 不能证明 |
+| --- | --- | --- | --- |
+| `tool_sequence_match` | 与 baseline 工具名序列做 LCS，相似度归一到 0～100 | 是否漏掉较多工具、顺序是否大幅漂移 | 参数正确、结果正确、另一条更优路径 |
+| `keyword_match` | must 命中比例；forbidden 命中直接 0 | 文本包含必要标记、没有禁语 | 语义和数值正确 |
+| `output_schema` | 最终文本解析 JSON，统计 required fields | 输出契约形状 | 字段值正确 |
+| `duration` | 阈值内 100，超限后指数平滑衰减 | 明显时延退化 | 排队/下游瓶颈归因 |
+| `token_cost` | reasoning + final text 的字符近似 Token；超限平滑衰减 | 明显冗长 | 精确账单、工具 Token、缓存收益 |
 
-- **O27.2 接入 CI**：PR 触发核心子集（5 分钟内跑完）；每日跑全量；效果下降超阈值阻断合并；
-- **O27.3 LLM-as-judge + 人工校准**：端到端用 LLM 评分（结论正确性、证据充分性、有无幻觉），每周人工抽检 20 条校准 judge 可靠性；
-- **O27.4 安全红队集**：专门维护 prompt 注入语料——**藏在告警内容、CMDB 备注、日志里的指令**，每次发版必跑。这与 Q23 权限体系配套（有了权限才有"拦截"可验证）。
+`custom` 不在本地 `scorer.Engine` 里完成：Engine 先放一个 NA 占位，Executor 再调用 `eval_scorer_agent` 加载指定 `scorer_skill`，解析 `{score, detail, evidence}` 后替换该维度。
+
+### 为什么从“扣分制 + completeness Judge”改成量化 scorer
+
+代码迁移痕迹表明，早期设计中的 `eval_suite_revisions`、`eval_scores`、`pass_rate`、`trial_count` 等结构被删除；当前实现改为 Suite 自身版本、Case 独立版本、量化维度和 NA 剔除。**删除和当前结构是代码事实；“为什么这样改”如果没有变更记录，只能作为工程推断表达。**
+
+推荐面试话术：
+
+> *“我从实现结果理解，这次演进是在可信度和覆盖面之间做取舍：JSON、关键词、时延和工具序列能用规则证明，就不让 LLM Judge 自由裁量；难以规则化的领域语义再下沉到 custom scorer。NA 让‘没有证据’不必被伪装成 0 分。不过这也牺牲了语义覆盖，所以 custom scorer 必须继续做证据契约和校准，不能只是把旧 Judge 换了个位置。”*
+
+不要把“LLM Judge 跑三次分数不一样”“Revision 对当前规模过重”说成已查到的历史决策，除非能补充 PR、会议纪要或设计评审证据。
+
+### custom scorer 与 Prometheus 大盘怎么答
+
+简版回答：
+
+> *“scorer skill 不是一句‘请给 0～100 分’的 Prompt，而是一份可执行判定 SOP。它先提取 Dashboard Artifact，再运行 Schema/布局校验、官方 PromQL parser 和可选的只读测试查询；LLM 只评需求覆盖与业务价值；最后由确定性脚本汇总并应用 hard cap。PromQL 要分语法、可执行性、指标类型语义和业务意图四层判断。”*
+
+先补一句实现边界，避免把方案说成现状：
+
+> *“但这套多脚本 scorer 目前是我建议的目标实现，不是仓库里已经落地的能力。当前 custom scorer 只把 `task_result`、工具名列表、原始 `dialog_trace` 和 config 发给 `eval_scorer_agent`；`tcum-ai-skills` 里还没有这个 scorer 包，也没有官方 PromQL parser 校验脚本。因此当前最多能利用被测 Skill 调 `PrometheusQuery` 的自检痕迹，不能保证评分器独立、逐条验证了所有表达式。”*
+
+脚本路由不能继续交给 LLM 自由选择。生产版 `SKILL.md` 应只允许一次 `skill_exec`：`python3 scripts/score.py`，完整 Trial JSON 走 stdin；由 `score.py` 确定性调用提取、Dashboard 校验、每条 PromQL 的官方 parser、可选只读查询及最终算分。并用 `promql_extracted == promql_parsed + promql_skipped_with_reason` 做覆盖率断言，防止“有校验脚本但实际漏调”。
+
+面试官追问“SKILL.md 怎么知道该调用哪个脚本”时，答案不是继续增加自然语言分支，而是：
+
+1. `SKILL.md` 只定义触发条件、唯一入口 `score.py`、stdin/stdout 契约和禁止事项；
+2. `score.py` 无条件提取证据，有 Dashboard 才做 Schema 校验，有非空 `expr` 就逐条强制 parse；
+3. 只有 parse 通过且有指标元数据才做语义规则，只有显式开启并命中数据源白名单才真查 Prometheus；
+4. 缺证据、权限错误和后端超时属于 `inconclusive/environment_error`，不能混成 Agent 的语法错误；
+5. 最后检查“提取数 = 已解析数 + 有理由跳过数”，不相等说明 scorer 自己失效。
+
+还要主动补一个 Grafana 特有细节：Panel 中的 PromQL 可能含 `$__rate_interval`、`$cluster`、`${namespace:regex}` 等模板变量，不能把原文直接送 parser 后就判错。`validate_promql.py` 应保留原式，按变量类型生成可审计的规范化表达式，再用与目标后端对齐版本的官方 parser 校验。无法解析的变量记为 `unresolved_template/inconclusive`，不能偷算为通过，也不能算作 Agent 语法错误。
+
+当前输入边界也要主动说：custom scorer 只独立收到 `TaskResult`、工具名序列、原始 `DialogTrace` 和 config；Case、Reasoning、Duration、结构化 ToolCall 及 Dashboard Artifact 没有作为独立字段传入。`RunMetaSkill` 目前也只是将生成文本暂存在 `Skill.Desc`，不能据此宣称已经自动发布包含 `scripts/` 的完整 Skill 包。
+
+脚本调用状态机、PromQL 四层校验、hard cap 和输出样例统一见[评测机制主文档的 scorer skill 设计](../01-机制原理/05-机制篇-Agent评测与评测体系.md#eval-custom-scorer)。
+
+### 当前最关键的六个短板
+
+1. **不可复现**：没有 RunManifest 固定 Skill hash、模型精确版本、prompt、工具 schema、数据快照和 scorer 版本。
+2. **结果真值不足**：主要保存文本和工具名，缺少结构化参数、ToolResult、最终 Dashboard/告警/工单状态等 Artifact。
+3. **数据集未治理**：Case 来源、风险切片、脱敏、owner、holdout 和覆盖率不完整。
+4. **统计能力不足**：一个 Case 只跑一次，没有 candidate-baseline 配对分布、方差和显著性。
+5. **Judge 未校准**：custom scorer 没有独立人工金标集、严重错误漏检率和版本回归。
+6. **没有发布闭环**：没有 Skill/Prompt MR 自动触发核心集、每日全量和 blocker 门禁。
+
+### 下一步的正确优先级
+
+| 优先级 | 动作 | 原因 |
+| --- | --- | --- |
+| P0 | 增加 RunManifest、结构化 ToolCall/Artifact 和 scorer 版本 | 先让每个分数可解释、可重放 |
+| P0 | 为 PromQL/Grafana/巡检配置做确定性执行验证 | 运维 Agent 中最接近编译/测试的低成本真值 |
+| P0 | 建立线上失败、历史工单、事故复盘组成的版本化 Dataset | 避免只测开发者手写 happy path |
+| P1 | baseline/candidate 配对重复执行，按风险切片报告 delta | 全局平均分会掩盖高风险退化 |
+| P1 | custom Judge 人工校准与争议样本仲裁 | Judge 本身也是需要验收的组件 |
+| P1 | PR 核心集、每日全量、线上 shadow 三层门禁 | 让评测真正进入交付流程 |
+
+### 追问导航
+
+- **问“源码完整链路”**：看[Agent 评测机制主文档](../01-机制原理/05-机制篇-Agent评测与评测体系.md)第 1、5 节。
+- **问“为什么不能只看最终答案”**：看主文档第 0、2 节。
+- **问“怎样做可信发布门禁”**：看主文档第 4～6 节。
+- **问“scorer_skill 怎样调用脚本验证 PromQL”**：看主文档 `5.3.1～5.3.4`，重点是“单一 `score.py` 入口 + 程序内确定性路由”。
+- **问“Langfuse 与执行 Trace 的关系”**：回答“Langfuse 负责观测，Eval 当前直接从 AG-UI SSE 构造 Trace”。
 
 ---
-
-
----
-
-### 补充｜Eval Suite 已落地版本 vs 设计文档：一次评测可信度的取舍（新增，2026-08-24）
-
-**结论先说**：iwiki 4025917312《Eval Suite 技术架构设计文档 v2.0》（2025-07-16）**已经落地为可运行代码**，但**实际代码架构比设计文档做了一次实质性重构**——不是简单实现，是"边做边推翻边做"的产物。这个演进过程本身，是我在面试讲"我们是怎么做评测的"最有价值的一段。
-
-#### 一、当前代码库真实评测能力（面试事实基础）
-
-**独立服务、独立进程、独立数据库领域**：
-
-```
-cmd/server/eval_suite/                      # 独立进程入口（8091 端口）
-├── main.go
-├── bootstrap/{init,setting}.go
-└── config/trpc_go.yaml
-
-interfaceadapter/controller/eval_suite/     # HTTP API 层
-└── eval_suite_api.go                       # 11 个 POST 接口（suite/case/run/trial CRUD）
-
-usercases/eval_suite/                       # 业务领域
-├── init.go                                 # AutoMigrate + DropTable 兼容清理
-├── po/                                     # 6 张表
-│   ├── eval_suite.go          # 套件（suite_code + version 联合唯一键）
-│   ├── eval_case.go           # 用例（全局共享 + 版本化，编辑产生 id_v2）
-│   ├── eval_run.go            # 一次评测执行
-│   ├── eval_trial.go          # 单 case 单 trial（无 trial_count）
-│   ├── eval_scheduler_task.go # pkg/scheduler 调度记录
-│   └── eval_task_lock.go      # 分布式锁
-├── dao/                                    # 数据访问层
-├── model/suite_data.go                     # ScenarioConfig / EvaluationDimension
-├── agui/client.go                          # AGUI SSE Streamer（12KB）
-├── service/
-│   ├── eval_suite_service.go               # 套件 CRUD + 版本管理
-│   ├── eval_case_service.go
-│   ├── eval_run_service.go                 # 触发 + 聚合编排
-│   ├── eval_trial_executor.go              # 核心：执行 skill + 打分（18KB）
-│   ├── eval_scheduler_init.go              # 与 pkg/scheduler 集成
-│   ├── eval_task_loader.go / eval_trial_task.go / eval_lock_manager.go
-│   ├── eval_skill_service.go               # skill name→id 反查 + UpsertSkill
-│   └── scorer/                             # 5 个内置量化 scorer + 引擎
-│       ├── scorer.go            # RuleScorer 接口 + Engine + Aggregate（163 行核心）
-│       ├── tool_sequence.go     # LCS 相似度（baseline 场景专属）
-│       ├── keyword.go           # must 命中比例 + forbidden 一命中即 0 分
-│       ├── token_cost.go        # 平滑衰减：100·exp(-k·max(0,ratio-1)²)
-│       ├── duration.go          # 平滑衰减（同公式）
-│       ├── output_schema.go     # required_fields 命中比例
-│       ├── tokenizer.go         # 字符近似 tokenizer（TODO：接入 cl100k_base）
-│       └── completeness.go      # 3 行注释，标注废弃
-```
-
-**执行时 3 个外部 AGUI 端点**（`eval_trial_executor.go` 常量，写死）：
-
-| 端点 | 用途 |
-|---|---|
-| `http://tcumai.woa.com/agent-agui-test/skill_evaluation_agent` | 被测 skill / 基准 skill 的执行环境 |
-| `http://tcumai.woa.com/agent-agui-test/eval_scorer_agent` | custom 维度的评分 skill 执行环境 |
-| `http://tcumai.woa.com/agent-agui-test/eval_scorer_generate_expert` | **meta-skill**：生成新 scorer skill 并 upsert 入库 |
-
-#### 二、与设计文档 v2.0 的 8 处关键差异（重构证据）
-
-面试如果被追问"你怎么证明代码是重构过的而不是首次实现"——`usercases/eval_suite/init.go` 就是铁证：
-
-```go
-_ = db.Migrator().DropTable("eval_suite_revisions")
-_ = db.Migrator().DropTable("eval_scores")
-// 以及 drop 一堆已废弃列：suite_id, active_revision_id, agent_id,
-// suite_revision_id, trial_count, pass_rate, passed, total_tokens...
-```
-
-**对照表**：
-
-| 维度 | 设计文档 v2.0 | 实际代码 v3 | 演进原因（我的解读） |
-|---|---|---|---|
-| **版本管理** | `eval_suites` 表 + `eval_suite_revisions` 表（JSON 快照） | `eval_suite` 表 `(suite_code, version)` 联合唯一键；case 抽独立表 | Revision 快照对小场景过重，两表合一 + case 全局共享更实用 |
-| **评分公式** | 扣分制 `max(0, 100 - Σdeductions)` | 加权聚合 `Σ(score×weight)/Σweight`，NA 不计分母 | **扣分制无法表达"不可判定"**——LLM Judge 本身不稳定时应该 NA 而不是扣满，量化制天然支持 NA 剔除 |
-| **判定粒度** | pass/fail + `pass_rate` | 纯量化 `avg_score`（0-100） | 二值化判定信息量太低，改 prompt 时看不出"变好一点"还是"变差一点"；量化才是趋势工具 |
-| **重复执行** | `trial_count=N` 取平均降 LLM 噪音 | 1 case = 1 trial，无重复 | LLM Judge 已废除，规则型 scorer 本身确定性，不需要靠重复消噪 |
-| **执行路径** | `pkg/scheduler` + `AgentManager` 直接调 `adk.Runner.Query`（进程内 Agent） | `pkg/scheduler` + **AGUI SSE 调 3 个远程专用评测 agent** | **物理隔离评测环境与业务环境**：写死 URL `tcumai.woa.com/agent-agui-test/*` 说明评测跑在专用集群，evalserver 已废弃就是最好证据 |
-| **内置评分器** | 2 个：`tool-sequence-lcs`（LCS）+ `completeness`（LLM Judge） | 5 个：`tool_sequence_match` + `keyword_match` + `token_cost` + `duration` + `output_schema`；`completeness` **标注废弃** | LLM Judge 不稳定被"用可解释的规则替换"——面试可讲：**这是评测可信度 vs 覆盖广度的取舍** |
-| **场景抽象** | `eval_factors.type = skill_change/model_change/...` 扩展字段 | `scenario = skill_direct / baseline_skill_compare / model_eval / agent_eval` 枚举，实际实现前两个 | 从"通用变更评测"聚焦到"skill 变更 + skill 对比"两个最刚需场景，其他挂枚举占位 |
-| **Custom Scorer** | 设计文档只提到"接口 + 注册表" | **`custom` metric 走 AGUI 调 scorer_skill**，并新增 `RunMetaSkill` 用 meta-skill 生成 scorer skill 并 upsert 入库 | 把 scorer 本身也做成 skill，让 QA 不需要写 Go 代码就能加评分器——**"评分器即 skill"是核心创新** |
-
-#### 三、5 个内置量化 scorer 的评分算法（可以在面试展开）
-
-| Scorer | 输入 | 算法 | 特殊行为 |
-|---|---|---|---|
-| **tool_sequence_match** | ActualTools + BaselineActualTools | LCS 长度 / max(len(a), len(b)) × 100 | **仅 baseline_skill_compare 场景启用**，非 baseline 记 NA；严格保序（[A,B,C] vs [C,B,A] 相似度 0.33） |
-| **keyword_match** | TaskResult + `{must, forbidden}` | hit(must)/total(must) × 100 | forbidden 一命中即 0 分（硬否决）；无 must 且无 forbidden 命中 → 100 分（无约束即满足） |
-| **token_cost** | reasoningText + taskResult + `{max_tokens, k}` | `ratio = tokens/max`；`score = 100·exp(-k·max(0, ratio-1)²)`，k 默认 3 | ratio ≤ 1 得满分，超限平滑衰减；用字符近似 tokenizer（**未来会接 tiktoken cl100k_base**） |
-| **duration** | DurationMs + `{max_ms, k}` | 同 token_cost 公式 | RUN_STARTED → RUN_FINISHED 毫秒 |
-| **output_schema** | TaskResult + `{required_fields}` | hit(required_fields)/total × 100 | TaskResult 非 JSON 直接 0 分（不给 NA，因为"不能解析"是明确失败） |
-| **custom** | 上面所有 trace + `{scorer_skill}` | **走 `eval_scorer_agent` AGUI 调用**，scorer skill 输出 `{score, detail, evidence}` JSON | 返回非 JSON / 缺 score 字段 → NA；AGUI 调用级失败 → NA + detail 记错误 |
-
-**共同设计取舍**：所有 scorer 都能返回 `NA`（不可判定）而非强行给分，`Aggregate` 时 NA 不进分母——这解决了设计文档扣分制的核心痛点：**"没有基准序列的场景"和"配置缺失"以前会误扣分，现在明确不计**。
-
-#### 四、`EvalTrialExecutor.Execute` 完整执行链路（Q27 面试最深追问的答案）
-
-```
-scheduler 触发 → EvalTrialExecutor.Execute(taskID)
-    │
-    ├─ 1. 加载 task/trial/run/suite/case（任何一步失败：trial→failed + tryAggregateRun）
-    ├─ 2. 解析 scenario_config（防前端多层 JSON 转义，unwrapJSONString 最多剥 10 层）
-    ├─ 3. 按场景执行：
-    │     - skill_direct：单跑被测 skill（120s 超时）
-    │     - baseline_skill_compare：先跑被测，再跑基准（240s trial 级总超时）
-    │     两者都经 AGUI SSE 调 skill_evaluation_agent，收回 Trace{TaskResult, ActualTools, ReasoningText, DurationMs, DialogTrace}
-    ├─ 4. scorer.Engine.JudgeAll：5 个内置 scorer 逐一判分，custom 占位 NA
-    ├─ 5. 对 custom 维度逐一走 AGUI 调 eval_scorer_agent（execCtx 已被 baseline 双跑耗光，
-    │     故用独立 customCtx 传入——#14 修复标注）
-    ├─ 6. scorer.Aggregate 加权聚合 → trial.score
-    │     （trace.Failed 时不写 score，避免失败 trial 参与聚合 —— #16 修复标注）
-    ├─ 7. 持久化 trial（Status/Score/ScoreDetail/DurationMs/CompletedAt）
-    └─ 8. CheckAndAggregateRun：全部 trial 完成后聚合 run.avg_score + score_report JSON
-```
-
-**代码里 30+ 个 `#N 修复`注释是宝藏**——每一条都是踩过的坑，面试深挖时可以就地展开（比如 #14 baseline 双跑耗尽 execCtx 导致 custom 全 NA、#16 failed trial 不写 score 防污染聚合、#25 executeAndScore 失败时不覆盖已算好的评分、#36 失败路径也触发聚合防 run 永卡 running……）。
-
-#### 五、meta-skill：设计文档没有的一处"评分器自动生成"能力
-
-`eval_trial_executor.go:RunMetaSkill` 是**唯一超出设计文档 v2.0 的能力**：
-
-```
-用户输入评分意图（自然语言） + meta-skill 名 + 新 scorer skill 名
-    ↓ AGUI 调用 eval_scorer_generate_expert
-    ↓ 输出 scorer skill 定义（SKILL.md 内容）
-    ↓ agent_access.UpsertSkill 入库
-    ↓ 后续 case 就能在 evaluation_dimensions 里引用这个新 scorer_skill
-```
-
-**这一步的价值在面试怎么讲**：*"scorer 本质是 skill，而 skill 可以由 LLM 生成——这是我们从'评分器是代码'跨到'评分器是可迭代资产'的关键动作。设计文档里 scorer 是硬编码的，实际实现里评分器可以**边评测边生成**，QA 说一句自然语言就能得到新 scorer skill。"*
-
-#### 六、面试话术三段式（更新版）
-
-> **① 主动摆事实**：*"我们有一个独立的 `eval_suite` 服务，代码全在 `usercases/eval_suite/` 和 `cmd/server/eval_suite/`，独立部署、独立数据库领域。核心是 6 张表 + 5 个量化 scorer + AGUI 调外部专用评测 agent，能对 skill 做 skill_direct 和 baseline_skill_compare 两种评测。"*
->
-> **② 讲重构（这才是关键差异化）**：*"但值得一提的是，代码和最初的设计文档 v2.0 有一次实质性重构——最开始设计是'扣分制 + LLM Judge completeness + Revision 快照'，实际做的时候发现三个问题：一是 LLM Judge 不稳定，同一个输出跑三次分不一样；二是扣分制在'配置缺失'和'无基准序列'场景会误扣；三是 Revision 快照对我们的规模属于过度设计。所以最终版把这三个全废了，改成'量化加权 + NA 剔除 + suite_code+version 联合唯一键'。init.go 里 `DropTable("eval_suite_revisions")` 和 `DropTable("eval_scores")` 就是证据。"*
->
-> **③ 讲最有意思的点**：*"最值得聊的是 meta-skill——我们让 scorer 本身也是 skill，然后再用一个专门的 meta-skill 来生成新的 scorer skill。QA 说一句'我想加一个检查告警诊断结论里是否包含云 API action 名的评分器'，meta-skill agent 就能产出对应的 scorer skill 定义，upsert 入库后 case 里直接引用。设计文档里没有这一步，是实现过程中长出来的能力——评分器从'代码资产'变成了'LLM 可迭代资产'。"*
-
-#### 七、当前落地版本仍在的 5 个短板（面试要主动讲，避免被击穿）
-
-| # | 短板 | 证据 | 补法 |
-|---|---|---|---|
-| 1 | **`completeness` 语义评估类 scorer 完全缺失** | `scorer/completeness.go` 只有 3 行"已废弃"注释 | 端到端结论质量必须靠 custom scorer skill 走 LLM Judge，等于把 LLM Judge 从"框架内置"下沉到"每个 case 自己配"，覆盖广度差 |
-| 2 | **AGUI endpoint 硬编码** | `eval_trial_executor.go` 顶部 3 个 `endpoint*` 常量写死 `tcumai.woa.com` | 应改为配置注入 + 支持多环境（dev/staging/prod）|
-| 3 | **Tokenizer 是字符近似** | `token_cost.go:NewTokenCostScorer()` TODO 标注要接入 `tiktoken-go` `cl100k_base` | 未接入时 `token_cost` 分数会有系统性偏差 |
-| 4 | **case 无自动生成** | 手工建 case 一条一条录 | 应有从 Langfuse trace 自动挑选高价值 session 作为 golden case 的通道，闭环反哺 |
-| 5 | **无 CI 集成** | 没有 skill MR → 自动 trigger run 的 webhook | 依然停留在"手动触发"，还是靠人自觉 |
-
-#### 八、这段话给我的面试分层次
-
-- **只问了一句"你们有评测吗"** → 只答 §六.① 那一段（30 秒）
-- **追问"怎么实现的"** → 展开 §一 目录结构 + §四 执行链路（2 分钟）
-- **追问"设计怎么演进的"** → §二 对照表 + §六.② 讲重构（3 分钟）
-- **追问"最有价值的一个点"** → §五 meta-skill（1 分钟）
-- **追问"当前还有什么没做"** → §七 5 个短板逐条摆事实（2 分钟）
 
 ## Q28. 如何防止能力回归？
 
@@ -1390,7 +1282,7 @@ scheduler 触发 → EvalTrialExecutor.Execute(taskID)
 **解决思路**：
 - **O28.1** **工具 Schema 快照测试**：把所有 `ToolInfo` 序列化为 golden 文件纳入版本控制，变更时 diff 显式可见；破坏性变更必须走废弃流程（配合 O7.1 别名机制）；
 - **O28.2** MCP 契约版本化：路径带版本（`/tcum-mcp/v1/monitor`），破坏性变更升版本并保留旧版一个周期；
-- **O28.3** 发布前置检查清单：schema lint（O8.2）+ 评测集（O27）+ 安全红队（O27.4）三项全绿才允许发布；
+- **O28.3** 发布前置检查清单：schema lint（O8.2）+ 评测核心集（Q27）+ 安全红队切片三项全绿才允许发布；
 - **O28.4（借鉴 Codex，强烈推荐）** **把 Agent 的 SystemPrompt迁到 git 文件**（`agents/{code}/PROMPT.md`），DB 只存版本引用。**这一个动作同时解决：prompt 版本管理、变更 review、回滚、变更审计四个问题，成本极低。**
 
 ---
@@ -1525,7 +1417,7 @@ scheduler 触发 → EvalTrialExecutor.Execute(taskID)
 | 🔴 P0 | **身份未透传+ 无 AuthZ + 无审计 + token 明文入库** | Q25 |
 | 🔴 P0 | **沙箱边界未确认 + 自由 bash 无危险模式检测** | Q24 |
 | 🔴 P0 | **RAG 三连坑：ES 内部 BM25↔kNN 融合退化为分数相加（向量分被量纲淹没）/ 无 `ScoreThreshold` 永远返回满 TopK / embedding 一致性无守卫**；另加灌库任务每 5 分钟全量重建且所有节点都跑 | Q18 |
-| 🟡 P1 | ~~无任何效果评测集~~ → **已落地 `eval_suite` 独立服务**（6 表 + 5 量化 scorer + AGUI 调专用评测 agent + meta-skill 生成新 scorer），从设计文档 v2.0 的"扣分制+LLM Judge+Revision 快照"重构为"量化加权+规则型 scorer"。**仍存的短板**：`completeness` 语义评估缺失 / AGUI endpoint 硬编码 / tokenizer 字符近似 / case 无自动化生成 / 无 CI 触发 | Q27 |
+| 🟡 P1 | ~~无任何效果评测集~~ → **已落地 `eval_suite` 独立服务**（6 类持久化实体 + 5 个量化 scorer + AGUI 调专用评测 agent + custom scorer skill 执行链）。代码还提供 meta-skill 生成入口，但产物目前只暂存在 `Skill.Desc`，不能说成完整 Skill 包已自动发布。**仍存的短板**：不可复现 / 结构化 Artifact 不足 / Judge 未校准 / 单 Case 单次执行 / 无 CI 触发 | Q27 |
 | 🔴 P0 | **上下文超限兜底未覆盖流式主链路**（`adaptiveContextModel.Stream` 直接透传，而 AG-UI 入口硬编码 `EnableStreaming: true`）+ 报告总结路径用裸模型且超预算只 warn 不裁剪 | Q3 |
 | 🔴 P0 | **无引用溯源 + 无数值校验**（运维决策依赖数值） | Q22 |
 | 🔴 P0 | **无独立审查 Agent + 无"完成定义"的可执行判定**（15 个 Agent 无一负责审查他人；`AfterModelRewriteState` 0 实现 = 无 CC Stop hook 等价物）；**记忆自进化"表结构全对、闭环全缺"**（`Source`/`Confidence`/`HitCount`/`TTL` 六字段齐备但无写入）；**反馈只进报表不回流** | 第四篇 |
@@ -1554,4 +1446,4 @@ scheduler 触发 → EvalTrialExecutor.Execute(taskID)
 >
 > *对照 Claude Code、Codex、OpenClaw，我最想抄的三样东西是：**Codex 的 `sandbox_mode × approval_policy` 两维权限矩阵**（把技术边界和流程边界分开）、**CC 的 `tokenCountWithEstimation`**（零 API 调用的精确 token 估算）、**Codex/CC 的 prompt 即文件进 git**（免费获得版本、review、回滚）。*
 >
-> *但我也清楚有三个问题是它们没有、我必须自己解的：**多租户 AuthZ 与审计**（它们都是单用户）、**多域意图路由的可度量性**（它们都是单域）、**结论不可自动验证时怎么做评测**（它们能靠跑测试）。第三个我们已经落地了独立的 `eval_suite` 评测子系统——不是简单实现设计文档 v2.0，是**做了一次实质性重构**：最初设计里的'扣分制 + LLM Judge completeness + Revision 快照'三个核心决策全废了（`init.go` 里 `DropTable("eval_suite_revisions")` 就是证据），改成了'量化加权 + NA 剔除 + suite_code+version 联合唯一键 + 5 个内置规则型 scorer + custom 走 AGUI 调 scorer_skill'。最值得讲的一处创新是 **meta-skill**：让 scorer 本身也成为 skill，然后再用专门的 meta-skill 来生成新 scorer skill——QA 说一句自然语言就能加评分器，评分器从'代码资产'变成'LLM 可迭代资产'。当前落地版还欠 5 个东西：语义评估类 scorer（completeness 已废弃、只能靠 custom scorer skill 走 LLM Judge，覆盖广度差）、AGUI endpoint 硬编码要改配置注入、tokenizer 要从字符近似升级到 cl100k_base、case 要能从 Langfuse trace 自动挑、以及 skill MR webhook 自动触发 CI——这五条我认为下一阶段该做。"*
+> *但我也清楚有三个问题是通用编码 Agent 不会替我们解决的：**多租户 AuthZ 与审计**、**多域意图路由的可度量性**、以及**结论不可自动验证时怎么评测**。第三点我们已经完成 0→1：`eval_suite` 能在真实 AG-UI 链路运行 Skill，保存 Trace，用 5 个规则 scorer 和 custom scorer 做 NA-aware 加权评分。迁移代码也能证明早期 Revision/扣分/pass-rate 结构被替换；至于替换原因，我会明确说是结合实现做出的工程解读，而不是冒充历史决策记录。当前最该补的不是再加一个聪明 Judge，而是 RunManifest、结构化 ToolCall/Artifact、版本化 Dataset、重复配对试验、Judge 校准和 CI 门禁。meta-skill 已打通“生成文本→UpsertSkill”的入口，但完整 `SKILL.md + scripts/` 文件包上传仍是 TODO。"*

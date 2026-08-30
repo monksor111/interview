@@ -7,7 +7,7 @@
 | 子目录 | 定位 | 入口文件 |
 |---|---|---|
 | [`DeepSeek-Harness/`](./DeepSeek-Harness/) | 开源 Agent Harness，Cordis 插件化 + 事件溯源范式 | [`00-源码架构与50问.md`](./DeepSeek-Harness/00-源码架构与50问.md) |
-| [`Eino/`](./Eino/) | 字节跳动 CloudWeGo 开源，Go 语言 LLM 应用开发框架 | [`00-源码架构与60问.md`](./Eino/00-源码架构与60问.md) |
+| [`Eino/`](./Eino/) | Go Agent 运行时：Compose、ADK、多 Agent、ReAct、Skill、MCP 与 TCUM-AI 实践 | [`00-源码架构与74问.md`](./Eino/00-源码架构与74问.md) |
 
 ---
 
@@ -31,7 +31,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| [`00-源码架构与60问.md`](./Eino/00-源码架构与60问.md) | 架构全局图 + 74 问，覆盖八大主题：是什么/为什么这样设计、怎么使用（含代码）、编排引擎实现原理、流式处理机制、Callback 与 CallOption、Interrupt & CheckPoint、ADK 与多智能体、面试式取舍与总结 |
+| [`00-源码架构与74问.md`](./Eino/00-源码架构与74问.md) | 以 Eino v0.8.0 与 TCUM-AI 源码为基线：多 Agent 九类拓扑对比、ReAct 有环图、Middleware 顺序、TCUM-AI 扩展点、Skill 三层渐进披露、MCP Server/Client 三条链，以及状态、上下文、工具治理、评测、安全等生产 Agent 核心领域 |
 
 **核心关键词**：Compile 期类型检查、Chain/Graph/Workflow 三种编排、四种流式范式（Invoke/Stream/Collect/Transform）、自动拼接/流化/合并/复制、Callback 五切点、CallOption 两级体系四级分发、Interrupt & CheckPoint、ADK（ChatModelAgent = ChatModel + Tools + ReAct Loop + Middleware）、AgentAsTool。
 

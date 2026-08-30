@@ -275,7 +275,7 @@ dsh 是这四家里**唯一**把 Plan / Progress / Delegate / Persist 四层**�
 
 #### 3.2 Progress 层：`@deepseek-ai/dsh-tool-todo`
 
-源码：[`packages/tools/tool-todo`](/Users/yaao/Documents/code/AI-agent/deepseek-harness/packages/tools) + `docs/tool-catalog.md#L1686`
+源码：[`packages/todo/tool-todo`](/Users/yaao/Documents/code/AI-agent/deepseek-harness/packages/todo/tool-todo) + `docs/tool-catalog.md#L1686`
 
 **核心机制**：
 

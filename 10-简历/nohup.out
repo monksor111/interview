@@ -1,9 +1,0 @@
-[i] Whistle@2.10.1 started
-[i] 1. Use your device to visit these URLs and note which one works:
-       http://127.0.0.1:8899/
-       http://10.78.44.98:8899/
-       Note: If none are accessible, check your firewall settings
-             For help, see https://github.com/avwo/whistle
-[i] 2. Set your device's HTTP PROXY to the working IP & PORT(8899)
-[i] 3. Open Chrome and visit http://local.whistlejs.com/ to begin
-[!] A new version is available (v2.10.8). Run 'npm i -g whistle' to update

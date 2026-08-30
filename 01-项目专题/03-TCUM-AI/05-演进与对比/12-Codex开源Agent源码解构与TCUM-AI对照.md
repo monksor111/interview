@@ -1,8 +1,8 @@
 # Codex 开源 Agent 源码解构：从 Coding Harness 到 TCUM-AI 的设计对照
 
-> **一句话结论**：`/Users/yaao/Documents/code/AI-agent/codex` 的远端是 `github.com/openai/codex.git`，因此它是 OpenAI 官方开源的 **Codex CLI、本地 Agent Runtime 与 App Server** 源码；它不是模型权重或完整云端服务端源码。它最值得借鉴的不是某一句 prompt，而是把“模型会调用工具”工程化为一套**有状态的执行内核 + 可验证权限边界 + 可回放事件流 + 可演化扩展面**。
+> **一句话结论**：本文分析的是 OpenAI 官方开源的 **Codex CLI、本地 Agent Runtime 与 App Server** 源码；它不是模型权重或完整云端服务端源码。最值得借鉴的不是某一句 prompt，而是把“模型会调用工具”工程化为一套**有状态的执行内核 + 可验证权限边界 + 可回放事件流 + 可演化扩展面**。
 >
-> **阅读边界**：以下结论基于本地仓库提交 `2764e83626efe55f64e04d153fc99a157327f3c2`（2026-08-26）和官方 OpenAI 文档。代码可证明本地客户端/运行时如何组织；不能据此声称看到了 GPT-Codex 的权重、训练数据、推理集群、云端策略或全部商业服务实现。官方文档说明 GPT-5-Codex 是面向 Agentic Coding 的模型，使用 Responses API；模型与 Harness 是两个层次，切勿混为一谈。
+> **阅读边界**：以下结论按 OpenAI 官方仓库提交 [`2764e83626efe55f64e04d153fc99a157327f3c2`](https://github.com/openai/codex/tree/2764e83626efe55f64e04d153fc99a157327f3c2)（2026-08-26）和官方 OpenAI 文档整理。当前工作区没有挂载 Codex 本地 clone，因此附录改用该固定提交的官方 GitHub 链接；不能把之后 `main` 分支的变化反推到这份快照。代码可证明客户端/运行时如何组织，但不能据此声称看到了模型权重、训练数据、推理集群、云端策略或全部商业服务实现。模型与 Harness 是两个层次，切勿混为一谈。
 >
 > **面试定位**：这篇不是“我们要做一个 Codex”的空泛竞品分析，而是把 Codex 的设计拆成可迁移原则，逐项回答：TCUM-AI 已经有什么、哪里只是雏形、下一步如何以最小代价补齐、为什么不机械照搬。
 
@@ -429,18 +429,18 @@ Codex workspace 的 `rollout`、`rollout-trace`、`thread-store` 独立成 crate
 
 | 主题 | 主要源码/文档路径 |
 |---|---|
-| 官方仓库身份与产品定位 | `/Users/yaao/Documents/code/AI-agent/codex/README.md`；`git remote -v` |
-| App Server、Thread/Turn/Item、审批和 MCP 生命周期 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/app-server/README.md` |
-| Agent 业务核心和跨平台 sandbox 说明 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/core/README.md` |
-| 上下文片段契约 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/context-fragments/src/fragment.rs` |
-| token budget 与 auto compact 状态 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/core/src/session/context_window.rs`、`token_budget.rs` |
-| AGENTS.md 分层发现 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/core/src/agents_md.rs`、`agents_md_tests.rs` |
-| Skill 加载、显式选择、隐式调用识别 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/skills/src/loading.rs`、`selection.rs`、`invocation.rs` |
-| 多 Agent V2 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/core/src/session/multi_agents.rs` |
-| Guardian 信任边界与审批审查 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/core/src/guardian/policy_template.md`、`prompt.rs`、`review.rs` |
-| 命令策略 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/execpolicy/README.md` |
-| OS sandbox | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/sandboxing/`、`codex-rs/core/README.md` |
-| rollout 和记忆两阶段管道 | `/Users/yaao/Documents/code/AI-agent/codex/codex-rs/rollout/`、`codex-rs/memories/README.md` |
+| 官方仓库身份与产品定位 | [README](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/README.md) |
+| App Server、Thread/Turn/Item、审批和 MCP 生命周期 | [app-server/README.md](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/app-server/README.md) |
+| Agent 业务核心和跨平台 sandbox 说明 | [core/README.md](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/core/README.md) |
+| 上下文片段契约 | [context-fragments/src/fragment.rs](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/context-fragments/src/fragment.rs) |
+| token budget 与 auto compact 状态 | [context_window.rs](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/core/src/session/context_window.rs) |
+| AGENTS.md 分层发现 | [agents_md.rs](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/core/src/agents_md.rs) |
+| Skill 加载、显式选择、隐式调用识别 | [skills/src/loading.rs](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/skills/src/loading.rs) |
+| 多 Agent V2 | [multi_agents.rs](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/core/src/session/multi_agents.rs) |
+| Guardian 信任边界与审批审查 | [guardian 目录](https://github.com/openai/codex/tree/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/core/src/guardian) |
+| 命令策略 | [execpolicy/README.md](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/execpolicy/README.md) |
+| OS sandbox | [sandboxing 目录](https://github.com/openai/codex/tree/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/sandboxing)、[core/README.md](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/core/README.md) |
+| rollout 和记忆两阶段管道 | [rollout 目录](https://github.com/openai/codex/tree/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/rollout)、[memories/README.md](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/memories/README.md) |
 | 官方模型边界 | [OpenAI 官方 GPT-5-Codex 模型页](https://developers.openai.com/api/docs/models/gpt-5-codex) |
 
 ## 附录 B：与现有面试材料的阅读顺序

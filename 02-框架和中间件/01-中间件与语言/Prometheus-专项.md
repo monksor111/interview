@@ -1,947 +1,574 @@
-# 第五卷 · 中间件 · Prometheus 与 Alertmanager 专项
+# Prometheus 专项：从 PromQL 到 TCUM 多存储查询与告警链路
 
-> **本篇定位**：Prometheus 是 TCUM/云原生监控事实标准 —— **拉模式采集 + 时序数据库 + PromQL + Alertmanager 告警链路** 一体。TCUM 生产上 Prometheus 承担采集协议标准 + 单集群/小规模场景本地存储；大规模场景 VictoriaMetrics 或 Thanos 兼容 Prometheus 协议做长期/横向扩展。本文覆盖架构、TSDB、Pull vs Push、Service Discovery、Federation、Remote Write、Recording Rule、Alerting Rule、Alertmanager 路由/分组/抑制/静默、生产实战、50+ 高频面试题。
-
-## 📖 目录
-- §1 命题：为什么 Prometheus 是云原生监控事实标准
-- §2 架构：Prometheus Server / Exporter / Pushgateway / Alertmanager
-- §3 拉模式 vs 推模式
-- §4 数据模型：metric / labels / sample / series
-- §5 TSDB 存储：Block / Chunk / WAL / Head
-- §6 Service Discovery
-- §7 PromQL 深度
-- §8 Recording Rule
-- §9 Alerting Rule
-- §10 Alertmanager：路由 / 分组 / 抑制 / 静默 / 集群
-- §11 Remote Write / Remote Read
-- §12 Federation
-- §13 高可用与长期存储
-- §14 生产实战：TCUM 中的 Prometheus / VM 融合
-- §15 版本演进
-- §16 50 问详解
-- §17 短板与坑
-- §18 面试话术
+> 目标：讲清 Prometheus 的数据模型、查询、规则与告警，同时能结合 TCUM 源码解释兼容 PromQL 的多存储执行层。
+>
+> 事实边界：仓库可以证明 TCUM 使用 Prometheus AST/PromQL 引擎、VictoriaMetrics 接口、ClickHouse/InfluxDB 查询代理和 Alertmanager webhook；不能据此推断完整部署拓扑、实例规模、长期存储副本数或性能倍数。
 
 ---
 
-## §1 · 命题：为什么 Prometheus 是云原生监控事实标准
+## 一、三分钟总览
 
-### 一句话背诵
+Prometheus 不只是一个时序数据库，而是一套围绕多维指标的协议和运行模型：
 
-> "Prometheus 用**多维度 label 数据模型 + Pull 采集 + PromQL 查询 + 单机 TSDB + 独立 Alertmanager** 定义了云原生监控标准。它不是最强的时序库（写入 VM 快 20x），但是**协议 + 生态标准**——K8s、几乎所有云原生组件都提供 `/metrics` 端点。"
+1. 目标暴露指标，Prometheus 通常主动拉取；
+2. metric name 与 labels 唯一确定一条时间序列；
+3. 本地 TSDB 保存样本，PromQL 在时间和标签维度上计算；
+4. recording rule 预计算高频表达式，alerting rule 生成告警状态；
+5. Alertmanager 负责分组、路由、抑制、静默和通知；
+6. remote write 把样本送到远端系统，但远端系统的查询与高可用模型各不相同。
 
-### 六大设计原则
-
-1. **Pull 模式**：Server 主动去 target 拉指标（相对 Push）
-2. **多维度 label 模型**：`metric{k=v,k=v}` 而非扁平命名（相对 Graphite）
-3. **本地时序存储**：单机 TSDB，无外部依赖（相对 InfluxDB 早期）
-4. **PromQL**：函数式查询语言
-5. **单机架构简单**：单二进制，无 master/worker
-6. **告警独立**：Alertmanager 单独部署处理告警路由
-
-### 边界代价（重要）
-
-- **单机存储上限**：TB 级，横向不能扩（需要 VM / Thanos / Cortex）
-- **不适合日志/事件**：只存数值时序
-- **数据可靠性弱**：本地磁盘挂 = 数据丢
-- **无鉴权**：靠反向代理 + 网络隔离
-- **Push 场景弱**：Pushgateway 是补丁不是主体
-- **长期存储弱**：默认 15 天，需要 remote_write 到 VM/Thanos
+TCUM 的特殊之处是把 PromQL 当作统一查询语言：服务先解析 AST、提取指标名，根据指标元数据选择 InfluxDB、ClickHouse 或默认存储的查询代理，再由嵌入式 PromQL 引擎执行。它降低了上层对存储的感知，但也带来跨存储表达式、标签语义对齐、下推能力和查询资源治理问题。
 
 ---
 
-## §2 · 架构
+## 二、架构与 Pull 模型
 
-### 组件
-
-```
-[Targets: node_exporter/blackbox_exporter/自定义 exporter]
-         ↑ pull /metrics
-[Prometheus Server]  ─── remote_write ──→ [VictoriaMetrics/Thanos]
-   │            │
-   │            └── evaluate rules → firing alerts
-   ↓                                         │
-[Local TSDB (blocks + WAL)]                  ↓
-                                    [Alertmanager]
-                                        │
-                                        └→ [Notification: 微信 / 邮件 / 电话]
+```text
+targets/exporters --scrape--> Prometheus --rules--> Alertmanager --> receivers
+                              |
+                              +-- remote write --> remote storage
 ```
 
-### 组件职责
+### 2.1 Pull 的价值
 
-- **Prometheus Server**：抓取指标 + TSDB 存储 + 执行 PromQL + 评估 Recording/Alerting Rule
-- **Exporter**：暴露 `/metrics`（node_exporter 采主机，blackbox 采探活，业务自埋点用 client_library）
-- **Pushgateway**：短生命作业（批处理）推指标临时存放，Prometheus 拉走
-- **Alertmanager**：接收 alerts → 分组 / 抑制 / 静默 / 路由 → 通知
-- **Service Discovery**：K8s / Consul / EC2 / File 等自动发现 target
+- 采集端统一控制频率、超时和目标状态；
+- 抓取失败自然形成 `up` 等健康信号；
+- 业务只暴露 HTTP metrics endpoint，不必知道中心地址；
+- 服务发现与 relabeling 在采集端集中治理。
 
----
+Pull 不是绝对优于 Push。短生命周期批任务可能在下一次 scrape 前结束，Pushgateway 可作为中介，但官方只建议有限场景使用。它会丢失目标天然健康检查，并且已推送 series 需要显式删除。
 
-## §3 · 拉模式 vs 推模式
+### 2.2 组件边界
 
-### Pull 优势
+- Prometheus Server：scrape、本地 TSDB、PromQL、规则评估；
+- Exporter/client library：暴露指标；
+- Service Discovery：发现目标；
+- Alertmanager：接收告警并管理通知；
+- Remote storage：扩展保留、容量或多租户能力，具体语义由实现决定。
 
-1. **Server 主动控制频率**：避免 target push 打爆 Server
-2. **健康检测天然**：pull 失败即知 target down（可作探活指标）
-3. **配置集中**：Prometheus 配置管理所有 target
-4. **对开发友好**：只需暴露 HTTP 端点，无需 Server 地址
-
-### Push 优势（Pushgateway 场景）
-
-- **短生命作业**：批处理任务，Prometheus 还没来拉就结束
-- **网络受限**：target 在防火墙后，Server 拉不到
-
-### Push 的坑
-
-- Pushgateway 不能持久化 —— 重启数据丢
-- 已推入的指标除非手动删除，永久保留（陷阱：作业名换了导致旧数据一直在）
-- **官方建议只用于短生命作业**，不要拿它当 Prometheus 用
+Prometheus 本地存储以单节点为边界。官方通过 remote storage 接口集成外部系统，而不是承诺内建分布式 TSDB。
 
 ---
 
-## §4 · 数据模型
+## 三、数据模型与基数
 
-### 4.1 基本概念
+### 3.1 Series 的身份
 
-- **metric name**：`http_requests_total`
-- **labels**：`{method="GET", handler="/api", status="200"}`
-- **timestamp**：ms 精度
-- **value**：float64
-- **series（时间序列）**：`metric{labels}` 唯一标识，一条 series 是一堆 (ts, value)
+```text
+http_requests_total{service="api", method="GET", status="200"}
+```
 
-### 4.2 四种指标类型
+metric name 与全部 labels 的组合确定 series。任一 label 值变化都会创建另一条 series。
 
-- **Counter**（计数器）：只增（reset 到 0 表示重启）—— `http_requests_total`
-- **Gauge**（仪表盘）：可增可减 —— `memory_usage_bytes`
-- **Histogram**（直方图）：预定义 bucket 区间计数 + sum + count —— `http_request_duration_seconds_bucket`
-- **Summary**（摘要）：客户端计算的分位数 —— `latency_summary`
+指标名应表达单一数量和单位，例如：
 
-### 4.3 Histogram vs Summary
+- `http_requests_total`
+- `http_request_duration_seconds`
+- `process_resident_memory_bytes`
 
-| 维度 | Histogram | Summary |
+### 3.2 四类指标
+
+| 类型 | 语义 | 常见查询 |
 |---|---|---|
-| 分位数计算 | 服务端 `histogram_quantile()` 估算 | 客户端预计算 |
-| 精度 | 依赖 bucket 划分 | 精确 |
-| 聚合 | ✅ 可跨实例聚合 | ❌ 无法聚合分位数 |
-| 客户端开销 | 低 | 高（stream 分位数算法） |
+| Counter | 单调增加，进程重启可 reset | `rate`、`increase` |
+| Gauge | 可增可减的瞬时值 | `avg_over_time`、直接聚合 |
+| Classic Histogram | bucket/count/sum 多条 series | `histogram_quantile` |
+| Summary | 客户端计算分位数与 count/sum | 本实例分位数展示 |
 
-**规则**：**做分位数选 Histogram**（因为要跨实例聚合），除非本地报告用 Summary。
+Histogram 分位数是按 bucket 估算的，精度依赖 bucket。Summary 的 quantile 通常不能跨实例正确聚合。选择前先确定是否需要跨实例聚合、可接受误差和观测区间。
 
-### 4.4 series 基数（Cardinality）
+### 3.3 高基数为什么危险
 
-- **series 数 = metric × label 值组合数**
-- **高基数是灾难**：`user_id` / `trace_id` 作 label → 千万级 series → 内存爆炸
-- **经验**：单实例 series < 500 万，label 组合 < 100
+`user_id`、`trace_id`、原始 URL 等无界 label 会持续创建 series，放大：
 
-### 4.5 命名规范
+- Head 内存与倒排索引；
+- WAL、磁盘与 remote write 流量；
+- 查询匹配和聚合成本；
+- rule evaluation 与告警实例数。
 
-- metric_name 用 snake_case：`http_requests_total`
-- 单位后缀：`_total`（Counter）、`_seconds`、`_bytes`
-- 前缀区分子系统：`process_` / `go_` / `http_`
-
----
-
-## §5 · TSDB 存储
-
-### 5.1 存储层次
-
-```
-data/
-├── wal/                      # Write-Ahead Log（防崩溃丢失）
-│   └── 000000
-├── chunks_head/              # 内存 Head Block 落盘的 mmap 块
-├── 01H..../                  # Block（2 小时一个块）
-│   ├── chunks/               # 时间序列数据
-│   ├── index                 # 倒排索引（label → series ID）
-│   ├── meta.json             # 元数据
-│   └── tombstones            # 删除标记
-└── 01H..../                  # 更多 Block
-```
-
-### 5.2 Head Block（活跃块）
-
-- 最近 2~3 小时数据**内存中**
-- WAL 记录所有写入，崩溃恢复用
-- **Head Compaction**：满 2h 转成磁盘 Block
-
-### 5.3 Chunk 压缩
-
-- **XOR 编码（Facebook Gorilla 论文）**：浮点数用异或增量存储，压缩率 12x+
-- 一个 chunk 120 sample（默认），压缩后几十字节
-- 单点数据平均**几个字节**，非常紧凑
-
-### 5.4 索引（每个 Block 独立）
-
-- **倒排索引**：label 键值 → series ID 列表
-- **series 信息**：series ID → (labels + chunk 位置)
-
-**查询流程**：
-1. PromQL 解析 → label matchers
-2. Block 倒排索引找 matchers 命中的 series 集合
-3. 按时间范围读对应 chunk
-4. 解压 XOR → 返回样本
-
-### 5.5 Compaction（压实）
-
-- 相邻 Block 合并成大 Block（2h → 6h → 24h → 更长）
-- 减少 Block 数量提升查询效率
-- 老 Block 保留时间由 `--storage.tsdb.retention.time` 决定（默认 15 天）
-
-### 5.6 磁盘占用估算
-
-- 一个样本约 1~2 字节（压缩后）
-- 10w series × 每 15s 一样本 × 天 = 10w × 5760 × 2 ≈ **1GB/天**
+没有通用“安全 series 数”。容量取决于采样间隔、活跃度、label 长度、查询和硬件。治理应设置 label allowlist、series budget、每 metric 基数告警，并在上线前基数压测。
 
 ---
 
-## §6 · Service Discovery
+## 四、PromQL 核心语义
 
-### 6.1 常用 SD
+### 4.1 四种值类型
 
-- **static_config**：手动列表
-- **file_sd**：文件（外部工具生成）
-- **kubernetes_sd**：K8s API 发现 pod / service / endpoint / node / ingress
-- **consul_sd** / **etcd_sd** / **eureka_sd**
-- **ec2_sd** / **gce_sd** / **azure_sd**
-- **dns_sd**：DNS SRV
+- Instant vector：每条 series 在一个评估时刻的样本；
+- Range vector：每条 series 在时间窗口内的样本序列；
+- Scalar；
+- String（很少作为最终结果）。
 
-### 6.2 K8s SD 典型配置
+Range query 不是一种不同的 PromQL 语言，而是在多个等间隔时间点反复评估同一 instant expression。
 
-```yaml
-- job_name: 'kubernetes-pods'
-  kubernetes_sd_configs:
-    - role: pod
-  relabel_configs:
-    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-      action: keep
-      regex: true
-    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
-      action: replace
-      target_label: __address__
-```
-
-**relabel_configs 是灵魂**：过滤、改标签、构造抓取地址。
-
-### 6.3 relabel 五大 action
-
-- **keep**：保留匹配的
-- **drop**：丢弃匹配的
-- **replace**：字段替换
-- **labelmap**：批量映射
-- **hashmod**：按 hash 分片（负载均衡多个 Prometheus）
-
----
-
-## §7 · PromQL 深度
-
-### 7.1 四种类型
-
-- **Instant Vector**：某时刻多个 series 的一组瞬时值（默认查询）
-- **Range Vector**：一段时间内多个 series 的样本集合（`[5m]`）
-- **Scalar**：标量
-- **String**：字符串（少用）
-
-### 7.2 基础语法
+### 4.2 Counter 先 rate，再聚合
 
 ```promql
-# 瞬时值
-node_cpu_seconds_total
-
-# 过滤
-node_cpu_seconds_total{mode="idle", instance="host1"}
-
-# 范围
-node_cpu_seconds_total[5m]
-
-# 时间偏移
-node_cpu_seconds_total offset 1h
-
-# 时间戳
-node_cpu_seconds_total @ 1720000000
+sum by (service) (rate(http_requests_total[5m]))
 ```
 
-### 7.3 常用函数
+先对每条原始 counter 做 `rate`，才能识别各自 reset；先 `sum` 再 `rate` 可能掩盖实例重启。
 
-- **rate(v[t])**：范围向量 counter 的**每秒平均增长率**
-- **irate(v[t])**：**瞬时变化率**（取最后两个点）
-- **increase(v[t])**：范围内增量
-- **delta / idelta**：Gauge 的差值
-- **histogram_quantile(0.99, sum(rate(...bucket[5m])) by (le))**：分位数估算
-- **avg_over_time / max_over_time**：范围聚合
-- **predict_linear(v[t], s)**：线性外推
+窗口要相对 scrape interval 足够长。过短窗口可能只有很少样本，结果抖动或为空。
 
-### 7.4 聚合运算符
-
-- `sum / avg / min / max / count / stddev`
-- `by (label1, label2)`：按 label 分组
-- `without (label1)`：排除 label 分组
-- `topk / bottomk / quantile`
-
-### 7.5 向量匹配
-
-- **1 vs 1（默认）**：labels 完全一致才匹配
-- **on(...) / ignoring(...)**：指定 join 的 label
-- **group_left / group_right**：一对多 join
-
-**经典陷阱**：
-```promql
-# 两 metric labels 不完全一致，直接除会为空
-memory_used_bytes / memory_total_bytes
-
-# 正确：on 或 ignoring
-memory_used_bytes / on(instance) memory_total_bytes
-```
-
-### 7.6 rate 陷阱
-
-- **rate 只能用于 Counter**，不能对 Gauge 用（结果没意义）
-- **rate([5m])** 的时间窗必须 ≥ 3~4 倍 scrape_interval，太短易受抖动影响
-- **rate 之前不能 sum**：`rate(sum(...))` 错误 —— sum 后重启信息丢失，rate 会得到负值。**必须 sum(rate(...))**
-- **Counter reset 检测**：rate 自动处理 counter 归零
-
-### 7.7 histogram_quantile 陷阱
+### 4.3 向量匹配
 
 ```promql
-histogram_quantile(0.99, sum(rate(http_duration_bucket[5m])) by (le))
+errors_total / on(service, instance) requests_total
 ```
-- **必须 rate 后 sum 前保留 `le` label**
-- 桶划分不精细则误差大：99 分位数在 [1s, 5s] 桶内会**线性插值**（可能实际是 5s 但报 3s）
+
+二元运算默认按完整 label set 匹配。`on(...)` 指定参与匹配的 labels，`ignoring(...)` 排除 labels；`group_left` / `group_right` 用于明确的一对多或多对一。
+
+若两侧都可能多条匹配同一 key，会产生 many-to-many 错误。修复方式是先聚合到唯一键，而不是随意添加 group modifier。
+
+### 4.4 缺失数据不等于零
+
+- 空向量：没有匹配 series 或 lookback 内无有效样本；
+- 数值 0：series 存在且值为零；
+- stale：目标或 label set 消失后的陈旧标记语义。
+
+`or vector(0)` 会丢失或改变 label 语义，不能机械使用。告警应区分“业务值为零”和“采集断了”。
+
+### 4.5 Histogram 分位数
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, service) (rate(http_request_duration_seconds_bucket[5m]))
+)
+```
+
+Classic histogram 聚合必须保留 `le`。bucket 设计应围绕 SLO 阈值，否则 P95 数字可能看似精确、实际误差很大。
+
+### 4.6 `offset`、`@` 与 subquery
+
+- `offset` 改变 selector 取数相对时间；
+- `@` 固定 selector 的评估时间；
+- subquery 对内部 instant expression 生成范围结果。
+
+它们容易制造大扫描。Grafana 的 range、step、窗口和 series 数共同决定成本，不能只限制 PromQL 字符长度。
 
 ---
 
-## §8 · Recording Rule
+## 五、TSDB 与 Remote Write
 
-### 目的
+### 5.1 本地 TSDB
 
-- **预计算高频复杂查询** → 减少查询时的 CPU
-- Grafana Dashboard 上高频用的 PromQL 提取
+核心结构：
 
-### 语法
+- Head：最近活跃数据与索引；
+- WAL：崩溃恢复；
+- blocks：时间分块后的 chunks、index、meta 与 tombstones；
+- compaction：合并 block，降低长期查询碎片。
+
+不能用固定“每样本 1～2 字节”估算所有系统。label、index、WAL、Head、稀疏度和压缩效果都会改变容量。
+
+### 5.2 Remote Write
+
+Prometheus 将接收的样本写入远端 endpoint。要监控：
+
+- queue backlog 与 shard；
+- dropped/retried samples；
+- endpoint latency/error；
+- WAL 增长和磁盘余量；
+- out-of-order、duplicate、label limit 错误。
+
+Remote write 成功并不代表远端查询立即可见；分布式存储可能存在写入、索引与查询延迟。
+
+### 5.3 Remote Read 的边界
+
+官方文档指出，Prometheus remote read 通常从远端取原始 series，再在本地执行 PromQL。这会受传输数据量和本地查询资源限制，不能等同于分布式 PromQL 下推。
+
+---
+
+## 六、Recording Rule 与 Alerting Rule
+
+### 6.1 Recording Rule
+
+把高频或昂贵表达式周期性计算并保存为新 series：
 
 ```yaml
 groups:
-  - name: cpu.rules
+  - name: api-sli
     interval: 30s
     rules:
-      - record: job:node_cpu:usage_rate5m
+      - record: service:http_error_ratio:rate5m
         expr: |
-          1 - avg by(job, instance)(rate(node_cpu_seconds_total{mode="idle"}[5m]))
+          sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum by (service) (rate(http_requests_total[5m]))
 ```
 
-**规则**：命名遵循 `level:metric:operation` 惯例。
+收益是查询稳定和复用；代价是新增 series、评估资源以及数据新鲜度。规则必须用 `promtool check rules` 和单元测试验证。
 
-**注意**：Recording Rule 也占存储（生成新 series），别 record 太多。
-
----
-
-## §9 · Alerting Rule
-
-### 语法
+### 6.2 Alerting Rule
 
 ```yaml
-groups:
-  - name: cpu.alerts
-    interval: 30s
-    rules:
-      - alert: HighCPU
-        expr: job:node_cpu:usage_rate5m > 0.8
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Instance {{$labels.instance}} CPU high"
-          description: "CPU is {{ humanizePercentage $value }}"
+- alert: ApiHighErrorRatio
+  expr: service:http_error_ratio:rate5m > 0.01
+  for: 10m
+  labels:
+    severity: page
+  annotations:
+    summary: "{{ $labels.service }} error ratio is high"
 ```
 
-### 关键字段
+- `for` 抑制短暂抖动；
+- `keep_firing_for` 可在条件刚恢复时继续短暂 firing；
+- labels 决定告警身份、路由和聚合；
+- annotations 用于说明，不应放进身份 labels。
 
-- **expr**：PromQL 结果非空即触发
-- **for**：持续时间（避免瞬时抖动）
-- **labels**：标签，Alertmanager 路由用
-- **annotations**：文本模板（渲染到通知）
-
-### 告警状态机
-
-- **inactive**：expr 未匹配
-- **pending**：匹配但 `for` 未到
-- **firing**：`for` 到了，推给 Alertmanager
-
-**Prometheus 每次 evaluation 都会推所有 firing alerts** 给 Alertmanager，AM 靠**指纹去重**。
+规则组串行评估；若一次评估超过 interval，后续周期可能被跳过。需监控 rule duration、failures、missed iterations 和 produced series。
 
 ---
 
-## §10 · Alertmanager
+## 七、Alertmanager
 
-### 10.1 核心能力
+### 7.1 四个核心能力
 
-- **分组（Grouping）**：相同类的告警合并成一封
-- **抑制（Inhibition）**：一个大告警发生时，抑制关联小告警
-- **静默（Silence）**：临时屏蔽（维护窗口）
-- **路由（Routing）**：按 label 分发到不同接收人
-- **通知集成**：邮件 / 微信 / 电话 / Slack / PagerDuty / webhook
+- Grouping：把相关告警合为一条通知；
+- Routing：按 label 路由到接收者；
+- Inhibition：当根因告警存在时压制下游告警；
+- Silence：在时间范围内按 matcher 静默。
 
-### 10.2 路由树
+`group_wait` 等待同组告警聚合；`group_interval` 控制同组新增告警通知；`repeat_interval` 控制仍 firing 的重复提醒。三者需结合故障响应目标设计。
 
-```yaml
-route:
-  receiver: 'default'
-  group_by: ['alertname', 'cluster']
-  group_wait: 30s
-  group_interval: 5m
-  repeat_interval: 4h
-  routes:
-    - match:
-        severity: critical
-      receiver: 'phone'
-    - match_re:
-        service: '^(db|cache)$'
-      receiver: 'infra-team'
-```
+### 7.2 HA 不是 exactly-once
 
-**核心字段**：
-- **group_by**：按哪些 label 分组
-- **group_wait**：**首批告警等多久收集同组的其他告警**（一起发）
-- **group_interval**：分组后续告警的最小间隔
-- **repeat_interval**：**同一分组重发间隔**（防止告警轰炸）
+Alertmanager 集群用 gossip 复制 silence 和 notification log。官方 HA 设计在分区时 fail-open：宁可重复通知，也尽量不漏关键告警。因此它追求至少一次，不承诺严格 exactly-once。
 
-### 10.3 分组示例
+Prometheus 应把告警发送到所有 Alertmanager 实例，而不是只经一个负载均衡目标。具体实例数由故障域和运维能力决定，不存在所有项目固定三节点的结论。
 
-- **group_by: [alertname, cluster]** → 100 台机同时 HighCPU 只发一封（合并所有 instance）
-- 关键设计：避免告警海啸
+### 7.3 告警质量
 
-### 10.4 抑制规则
+一个好告警需要：
 
-```yaml
-inhibit_rules:
-  - source_matchers:
-      - severity="critical"
-      - alertname="NodeDown"
-    target_matchers:
-      - severity="warning"
-    equal: ['instance']
-```
-
-**含义**：节点 down 时，同 instance 的 warning 告警被抑制（避免噪声）。
-
-### 10.5 静默
-
-- Web UI 或 API 创建
-- 按 label matcher 匹配
-- 常用于**发布/维护窗口**
-
-### 10.6 Alertmanager 集群
-
-- **多副本 + gossip 协议**
-- **不需要外部协调**（无 ZK/etcd 依赖）
-- **去重**：告警指纹 + gossip 同步"已发送"状态
-- **静默**同步到所有节点
-- 生产建议 **3 节点集群**避免单点
-
-### 10.7 消息去重
-
-- Prometheus 高可用部署时**多个 Prometheus 实例都发相同告警**给 AM 集群
-- **AM 靠告警指纹（labels hash）去重** → 客户端只收一份
+- 对应用户/系统影响；
+- 有明确 owner 与严重级别；
+- 包含 dashboard/runbook 链接；
+- 控制实例 label，避免告警风暴；
+- 用依赖抑制和分组表达拓扑；
+- 统计触发次数、确认/恢复时长和无行动告警比例。
 
 ---
 
-## §11 · Remote Write / Remote Read
+## 八、TCUM 源码案例一：PromQL 作为多存储统一查询层
 
-### Remote Write
+核心源码：
 
-- Prometheus 把每次采集的样本**实时写到远程存储**（VM / Thanos / M3 / Cortex）
-- **本地存储仍有**（可保留短期）
-- 协议：**Snappy 压缩的 Protobuf**（HTTP POST）
-- 生产标配：Prometheus 采集 + remote_write to VM + VM 做长期查询
+- `service/bizservice/pqlqueryservice/service.go`
+- `service/bizservice/pqlqueryservice/proxy-manager/proxy_manager.go`
+- `service/integration/promql-proxy/`
 
-### Remote Read
+### 8.1 实际执行流程
 
-- PromQL 查询时从远程读数据
-- **少用**（性能差、协议兼容问题）
-- 推荐**直接查远程存储**（VM 的 vmselect）
+`preparePromQLExecution` 大致执行：
 
----
+1. 检测指标名正则等特殊形式并尝试转换；
+2. 用 Prometheus `parser.ParseExpr` 解析 AST；
+3. 失败时尝试自研 v2→v3 converter，再重新解析；
+4. 从 AST 提取指标名；
+5. 根据指标元数据选择对应 `PromqlProxy`；
+6. proxy 作为数据查询层，交给 PromQL 引擎执行 instant/range query；
+7. 把内部 `promql.Result` 转换为公共 model Vector/Matrix/Scalar。
 
-## §12 · Federation
+这说明 TCUM 获取执行结果的主链路不是 Langfuse。Langfuse可记录 Agent trace；PromQL 结果来自 TCUM 查询服务和底层存储代理。
 
-### 概念
+### 8.2 设计价值
 
-- 一个 Prometheus 从另一个 Prometheus 拉聚合后的指标
-- **只拉聚合指标，不拉明细**
-- 用于**跨集群/跨机房数据汇聚**
+- 上层统一使用 PromQL；
+- 存储选择收口在指标元数据与 proxy manager；
+- 复用官方 AST/engine，避免自写完整查询语言；
+- 可在 proxy 中实现标签映射和有限下推。
 
-### 局限
+### 8.3 明确边界：跨存储表达式
 
-- 不适合大规模（还是拉，会有 30s scrape 延迟）
-- **推荐用 remote_write 到中央 VM/Thanos** 代替 Federation
+源码有 TODO：支持表达式中不同指标位于不同存储，例如 `a + b` 且 a、b 分别在 ClickHouse 和 InfluxDB。
 
----
+当前逻辑主要提取一个指标名来选 proxy，因此不能把它描述成完整的联邦查询优化器。真正支持跨存储需要：
 
-## §13 · 高可用与长期存储（集群模式全景）
+1. 遍历 AST 找出全部 vector selector；
+2. 分别解析存储归属；
+3. 按可下推子树拆分执行计划；
+4. 统一 labels、时间戳、staleness 与 lookback；
+5. 在协调层做向量匹配和聚合；
+6. 设置跨源 fanout、样本数和超时预算。
 
-### 13.1 Prometheus 本质上是单机
+### 8.4 Converter fallback 的风险
 
-**关键认知**：**Prometheus 本身是单机时序库，不是分布式系统**。这是它设计哲学的选择——简单可靠优于分布式复杂度。
+解析失败后自动改写查询有兼容价值，但必须保证语义等价。建议：
 
-**没有的**：
-- 没有原生集群模式
-- 没有内建选主
-- 没有内建数据分片
-- 没有内建自动故障切换
-
-**有的**：
-- HA 部署（双跑）
-- Remote Write 到分布式存储（VM/Thanos/Mimir）
-- Alertmanager 自己有集群
-
-### 13.2 HA 部署（双跑模式）
-
-**架构**：
-```
-        ┌─────────────────┐
-        │  Target Pods    │
-        │ (K8s / VM / 主机)│
-        └────────┬────────┘
-                 │
-       同时被两个 Prom 拉取
-                 │
-        ┌────────┴────────┐
-        ▼                 ▼
-   ┌─────────┐       ┌─────────┐
-   │ Prom-A  │       │ Prom-B  │  ← 相同配置，独立运行
-   │ 本地TSDB │       │ 本地TSDB │  ← 数据独立各自完整
-   └────┬────┘       └────┬────┘
-        │                 │
-        └────────┬────────┘
-                 │
-         ┌───────▼────────┐
-         │  Alertmanager  │  ← 集群化，通过指纹去重两 Prom 的告警
-         │   Cluster      │
-         └────────────────┘
-```
-
-**核心机制**：
-- **不是主从，是双活**：两个 Prom 都在采集、都在存储、都在评估规则
-- **没有数据同步**：各自独立，彼此不感知
-- **数据一致性靠幂等采集**：同 target 同时间点采集结果一致（假设 target 状态没变）
-- **告警去重靠 Alertmanager**：AM 对 label 指纹去重，同告警只发一次
-
-**HA 部署的取舍**：
-- 优点：极简，无外部依赖，任一 Prom 挂了另一个继续工作
-- 缺点：
-  - 双倍存储成本
-  - 查询时**数据可能有毛刺不一致**（各自采样时间不完全同步，rate 计算可能微差）
-  - 需要客户端选一个 Prom 查（LB 无法完美合并两 Prom 数据）
-
-### 13.3 Alertmanager 集群
-
-**AM 是 Prometheus 生态里唯一有集群的组件**。
-
-**架构**：
-```
-   ┌─────────┐     ┌─────────┐     ┌─────────┐
-   │  AM-1   │◄───►│  AM-2   │◄───►│  AM-3   │
-   └─────────┘gossip └───────┘ gossip └───────┘
-       ▲            ▲              ▲
-       │            │              │
-       └────每 Prom 都发给所有 AM──────┘
-       
-       ↓ 去重后
-   通知：企业微信 / 邮件 / 电话
-```
-
-**核心机制**：
-1. **每个 Prom 把 firing alert 发给所有 AM**（多路径避免丢）
-2. **AM 之间用 gossip 协议同步**已发送状态和 silence
-3. **去重**：AM 收到相同指纹（labels hash）的 alert 视为同一个
-4. **通知分片**：一个 AM 负责一个 alert group 的通知发送，其他 AM 只做备份
-
-**为什么 AM 不用 Raft？**：
-- 告警场景对**可用性 > 强一致**
-- 网络分区时希望**每个分区都能发通知**（宁可重复也不能漏）
-- gossip 最终一致就够了
-
-**部署建议**：3~5 节点集群，跨 AZ 部署。
-
-### 13.4 长期存储方案对比
-
-| 方案 | 架构 | 集群模型 | 特点 |
-|---|---|---|---|
-| **Thanos** | Prom sidecar 上传 Block 到 S3；Query 统一入口 | Query 无状态可扩，Store Gateway 无状态，S3 提供持久化 | 依赖 S3；查询慢 |
-| **Cortex / Mimir** | 中心化架构，多租户 | Ingester + Distributor + Querier + Store + Compactor 分离；分布式一致性哈希 | 组件多运维复杂；多租户强 |
-| **VictoriaMetrics** | vminsert + vmstorage + vmselect | vminsert/select 无状态，vmstorage 一致性哈希分片 + 副本 | 无外部依赖；性能好；生产推荐 |
-| **M3DB** | Uber 出品 | 类似 Cassandra 一致性哈希 + 多副本 | 重量级，中小规模用不上 |
-
-**TCUM 生产**：VictoriaMetrics 作为长期存储主力（详见 [VictoriaMetrics-专项.md](./VictoriaMetrics-专项.md)）。
-
-### 13.5 完整生产架构（HA + 长期存储 + AM 集群）
-
-```
-        [K8s Pods / Targets]
-                 │
-        ┌────────┼────────┐
-        ▼                 ▼
-   ┌─────────┐       ┌─────────┐
-   │ Prom-A  │       │ Prom-B  │
-   │(边缘采集)│       │(边缘采集)│
-   └────┬────┘       └────┬────┘
-        │                 │
-        └───remote_write──┤
-                          ▼
-             ┌────────────────────┐
-             │  VictoriaMetrics   │
-             │   Cluster          │
-             │  (vmi + vms + vmq) │
-             └──────────┬─────────┘
-                        │
-                        ▼
-                   [Grafana / vmalert]
-        
-        Prom-A/B 都推 firing alerts →
-        ┌────────────────────────────┐
-        │  Alertmanager Cluster (3)  │
-        │  gossip 去重                 │
-        └───────────┬────────────────┘
-                    │
-                    ▼
-             [微信/邮件/电话]
-```
-
-### 13.6 数据不丢 & 恢复
-
-**Prometheus 本地数据**：
-- WAL 保证已写入 buffer 但未 flush 的数据崩溃可恢复
-- **本地磁盘挂 = 该 Prom 数据丢**（另一 Prom 有）
-- **HA 双跑是唯一手段**（无副本机制）
-
-**Remote Write 兜底**：
-- Prom 本地是短期存储（几天）
-- 长期数据在 VM/Thanos，那边有自己的副本机制
-- Prom 磁盘挂了不影响长期数据
-
-**恢复流程**：
-- 单 Prom 挂：另一 Prom 继续工作 → 修复重启 → **不需要数据恢复**（历史已在 VM）
-- 全部 Prom 挂：告警链路中断，采集断，靠 VM 里的历史 backfill 查看趋势
-- Alertmanager 集群挂多数派：通知能力降级但不完全丢失
-
-### 13.7 vmagent + Prometheus 演进
-
-**新架构趋势（推荐）**：用 **vmagent** 代替 Prometheus 做采集。
-
-**vmagent 优势**：
-- 更轻（几十 MB 内存 vs Prom 几 GB）
-- 无本地 TSDB（不需要磁盘）
-- 内建 remote_write 缓冲（磁盘 WAL 防丢）
-- 支持 Prom scrape_configs 配置
-
-**演进路径**：
-```
-第一代：Prom 采 + 本地存 + Grafana 查 Prom
-     ↓
-第二代：Prom HA + AM 集群 + Prom 远程写 VM/Thanos
-     ↓
-第三代：vmagent 采（无本地存）+ VM 集群 + vmalert 告警评估 + AM 集群
-```
-
-**面试模板**：
-> "生产走第三代架构：vmagent 每 K8s 节点部署为 DaemonSet 做本地采集，remote_write 到中心 VM 集群（vminsert + vmstorage 3 副本 + vmselect）；vmalert 从 VM 查数据评估告警规则推给 Alertmanager 3 节点 gossip 集群。Prom 本身在这个架构里已经被 vmagent 取代——历史包袱迁移中的场景仍保留 Prom HA 双跑。"
+- 保存 original、converted 与 rewrite reason；
+- 对 AST 做归一化差异测试；
+- 无法证明等价时返回显式错误；
+- 建立真实查询 corpus 回归；
+- 不要“转换失败就静默执行原查询”。
 
 ---
 
-## §14 · 生产实战：TCUM 中的 Prometheus / VM 融合
+## 九、TCUM 源码案例二：范围查询治理
 
-### 14.1 采集架构
+`QueryRange` 对超过 24 小时的查询目前只打印日志，仍继续执行。环境配置中存在 lookback、timeout、max samples 等限制，但长 range 的成本还取决于 step 和 series 数。
 
-```
-K8s Pods (Exporter/自埋点)
-  │
-  ├── kube-state-metrics
-  ├── node_exporter (DaemonSet)
-  └── 业务 /metrics
-    │
-    ↓ Pull (Prometheus 边缘)
-[Prometheus] ─── remote_write ──→ [VictoriaMetrics 中心]
-    │                                    ↑
-    │                                    │
-    └── evaluate rules → firing ───→ [Alertmanager 集群]
-                                          │
-                                          ↓
-                              [Notification: 微信/邮件/电话/Webhook]
+应把查询预算建模为：
+
+```text
+estimated_points ≈ matched_series × (end-start)/step
 ```
 
-### 14.2 边缘 Prometheus vs 中心 VM
+完整治理包括：
 
-- **边缘 Prometheus** 短保留（1~7 天）+ 本地评估 recording/alerting rule
-- **中心 VM** 长期存储（30~365 天）+ 全局查询 + Grafana 后端
+- start/end/step 合法性；
+- 最大时间范围与最大点数；
+- 每租户并发、队列和成本预算；
+- 查询超时向下游传播；
+- recording rule/预计算引导；
+- slow query 指纹、扫描 series/points 和被拒原因。
 
-### 14.3 分层告警设计
-
-- **L1 基础设施**：CPU/内存/磁盘/网络（node_exporter）
-- **L2 平台/中间件**：Redis/MySQL/Kafka/ES 各自 exporter
-- **L3 业务/SLO**：错误率 / 延迟 / 饱和度（RED/USE 方法）
-- **L4 端到端拨测**（blackbox_exporter）
-
-### 14.4 告警治理
-
-- **for 至少 2min**（避免抖动）
-- **合理分组** by (service, alertname) 避免海啸
-- **severity 分级** critical / warning / info，不同通道
-- **runbook 链接**：annotations 里带 wiki 链接指导 on-call
-- **抑制规则**：NodeDown 抑制该节点其他告警
-
-### 14.5 高基数控制
-
-- 禁止把 `user_id` / `trace_id` / `path` 作为 label
-- 定期审查 `count({__name__=~".+"})` 各 metric series 数
-- 单 metric series > 1w 报警
+只记录“超过 24h”而不拒绝、降采样或改写，不能形成资源隔离。
 
 ---
 
-## §15 · 版本演进
+## 十、TCUM 源码案例三：SLO PromQL 分片并行
 
-| 版本 | 关键 |
-|---|---|
-| 1.x | 早期，被 2.x 全面替代 |
-| 2.0 | 全新 TSDB，性能提升 |
-| 2.5+ | Recording rule 优化 |
-| 2.20+ | remote_write metadata support |
-| 2.30+ | agent mode（无本地存储） |
-| 2.40+ | Native Histogram（新式直方图，8~10x 更省） |
-| 2.45+ | LTS 版本 |
-| 2.50+ | 更多 PromQL 优化 |
+源码：`service/bizservice/sloservicev2/slov2_promql_shard.go`。
+
+实际策略：
+
+- 把 module/probeProduct label 列表按固定大小拆片；
+- 用正则构造每片 PromQL instant query；
+- 信号量限制并发；
+- 结果合并为 `label -> regions`；
+- 全部分片失败才返回 error，部分失败返回成功片数据并记录错误。
+
+### 10.1 价值
+
+- 控制单条正则和底层 series 扫描范围；
+- 并行降低端到端耗时；
+- 有并发上限；
+- 部分失败降级，不让单片拖垮整批。
+
+### 10.2 风险
+
+- 固定 shard size 是经验参数，不是成本模型；不同 label 的 series 基数可能差异巨大；
+- 部分失败返回 nil error，调用者如果只看 error 会把不完整数据当完整；
+- 信号量获取 `sem <- struct{}{}` 没有 select context，取消时等待中的 goroutine不能及时退出；
+- 日志打印完整 PromQL，可能过长或暴露敏感标签；
+- 返回 region 未排序，若下游依赖顺序会产生不稳定结果。
+
+建议结果返回 `data + completeness + failed_shards`，把 partial 明确放进协议；按估算 series/历史耗时自适应拆片，并为等待信号量增加 context。
 
 ---
 
-## §16 · 50 问详解
+## 十一、TCUM 源码案例四：Alertmanager 后的自有告警处理
 
-### 【架构与模型】
+核心源码：
 
-**Q1. 为什么 Prometheus 是云原生监控事实标准？**
-> 多维 label 数据模型 + Pull 采集 + PromQL + 单机 TSDB + 独立 Alertmanager。K8s 及几乎所有 CNCF 组件都提供 /metrics，生态标准化。
+- `service/bizservice/alarmservice/alarm_rule_service.go`
+- `service/bizservice/alertservice/alert_service.go`
+- `service/cache/alarmcache/silence_runtime.go`
+- `service/dao/t_mstack_alarm_history_dao.go`
 
-**Q2. Pull 和 Push 的优劣？**
-> Pull 优势：Server 控制频率、天然探活、配置集中；Push 优势：短生命作业、防火墙场景。Prometheus 用 Pull，短生命用 Pushgateway 补充。
+仓库能证明：
 
-**Q3. Pushgateway 什么时候用？什么时候不用？**
-> 用：短生命 cron job；不用：长服务（Prometheus 直接拉）、大流量（PG 变瓶颈）、需要历史（PG 不持久）。
+- 规则配置会生成 Alertmanager route/receiver 相关参数；
+- webhook 接收告警后执行 TCUM 自有静默匹配；
+- active 与 silenced 告警都会写历史，静默告警不会从审计链路消失；
+- 静默命中数按 tenant/silence 维度记录；
+- 告警历史支持创建、更新、聚合、过期和增量同步。
 
-**Q4. 四种 metric 类型？**
-> Counter（只增）/ Gauge（可增减）/ Histogram（服务端算分位）/ Summary（客户端算分位）。**分位数选 Histogram**（可聚合）。
+因此 TCUM 并非完全依赖 Alertmanager 自带 silence，而是在通知入口后又有一层领域静默与历史治理。好处是租户/策略模型可控；代价是必须保证两层静默语义、matcher 兼容和配置传播一致。
 
-**Q5. Histogram 和 Summary 怎么选？**
-> Histogram：服务端 `histogram_quantile` 估算，可跨实例聚合，bucket 精度影响准确度；Summary：客户端算，精确但不可聚合。**云原生场景推 Histogram**。
+更详细项目链路见：
 
-**Q6. 什么是高基数？为什么危险？**
-> series 数 = metric × label 组合。把 user_id / trace_id 当 label → 千万 series → 内存爆炸、查询慢、TSDB 索引膨胀。经验：单实例 <500w series。
-
-### 【TSDB 存储】
-
-**Q7. Prometheus 存储结构？**
-> WAL + Head（内存 2~3h）→ 满 2h 转 Block（磁盘） → Compaction 合并大 Block。默认保留 15 天。
-
-**Q8. 一个 Block 里有什么？**
-> chunks（时序数据，XOR 压缩）+ index（label 倒排索引）+ meta.json + tombstones（删除标记）。
-
-**Q9. XOR 压缩是什么？**
-> Gorilla 论文的浮点数增量存储：相邻 value XOR 后前导零编码。压缩率 12x+，一个样本平均几字节。
-
-**Q10. WAL 的作用？**
-> Head Block 内存写入前先追加 WAL，崩溃恢复时重放。默认每 10s fsync。
-
-**Q11. TSDB 的查询流程？**
-> PromQL → label matchers → Block index 倒排找 series → 时间范围过滤 → chunk 解压 XOR → 返回样本。
-
-**Q12. 数据保留时间怎么控制？**
-> `--storage.tsdb.retention.time=30d`（时间）或 `retention.size=100GB`（磁盘上限）。长期靠 remote_write。
-
-### 【Service Discovery】
-
-**Q13. 常用 SD 有哪些？**
-> static / file / kubernetes / consul / dns / EC2/GCE 等。**K8s 环境用 kubernetes_sd 是必须**。
-
-**Q14. Relabel 五大 action？**
-> keep（保留匹配）/ drop（丢弃）/ replace（替换字段）/ labelmap（批量映射）/ hashmod（分片）。
-
-**Q15. relabel_configs 和 metric_relabel_configs 区别？**
-> relabel：抓取前对 target 元 label 处理；metric_relabel：抓取后对 metric label 处理。抓取过滤优先前者省网络。
-
-### 【PromQL】
-
-**Q16. Instant Vector 和 Range Vector 区别？**
-> Instant：某时刻多 series 的一组瞬时值；Range：一段时间的样本集合（`[5m]`）。rate/increase 等函数要 Range。
-
-**Q17. rate 和 irate 区别？**
-> rate：范围内**平均**每秒增长；irate：取最后两个点的**瞬时**变化。图表用 rate 平滑，告警可用 irate 敏感。
-
-**Q18. rate 陷阱？**
-> ① 只能用 Counter ② `sum(rate(...))` 而不是 `rate(sum(...))`（sum 后 counter 重置信息丢失得负值）③ 窗口 ≥ 3~4 倍 scrape_interval。
-
-**Q19. histogram_quantile 陷阱？**
-> ① rate 之后要保留 le label（`sum by (le)(...)`）② bucket 划分不细误差大 ③ P99 落在 [1s,5s] 桶会**线性插值**估 3s，实际可能是 5s。
-
-**Q20. increase 和 rate 什么关系？**
-> `increase(v[5m]) = rate(v[5m]) * 300`。都可以，`rate` 更常用（结果是 per-second）。
-
-**Q21. 向量匹配为什么会没结果？**
-> 两 metric labels 不完全一致，1-to-1 匹配失败。用 `on(...)` / `ignoring(...)` 指定 join label，或 `group_left/right`。
-
-**Q22. PromQL 支持子查询吗？**
-> 支持（2.7+）：`max_over_time(rate(http[5m])[30m:1m])` = 过去 30 分钟每分钟计算一次 5 分钟 rate，取最大。**子查询贵，慎用**。
-
-**Q23. topk 和 sort 区别？**
-> topk 返回前 K 个 series；sort 返回全部但排序。**告警场景常用 topk 减少数据量**。
-
-### 【Recording Rule / Alerting Rule】
-
-**Q24. Recording Rule 有什么用？**
-> 预计算高频复杂 PromQL，Grafana 查预计算结果快得多。命名遵循 `level:metric:operation`。**代价**：生成新 series 占空间。
-
-**Q25. Alerting Rule 的 for 是什么？**
-> 匹配持续时间。for=5m 表示条件持续 5min 才 firing。防止瞬时抖动误报。
-
-**Q26. pending 和 firing 区别？**
-> pending：条件匹配但 for 未到；firing：for 到了推给 AM。
-
-**Q27. Rule 评估失败会怎样？**
-> 单个 rule 失败不影响其他，Prometheus `prometheus_rule_evaluation_failures_total` 指标暴露。生产要监控这个。
-
-### 【Alertmanager】
-
-**Q28. AM 三大核心能力？**
-> 分组（合并同类）、抑制（大告警屏蔽小）、静默（临时屏蔽）+ 路由分发。
-
-**Q29. group_wait / group_interval / repeat_interval 分别是什么？**
-> group_wait：**首批**告警到达后等多久收集同组的其他告警一起发（30s 常用）；group_interval：**同组新增**告警发送间隔；repeat_interval：同分组**重复通知**间隔（4h 常用防轰炸）。
-
-**Q30. 抑制规则怎么写？**
-> source_matchers 匹配大告警 + target_matchers 匹配要抑制的 + equal 指定共同 label。例：NodeDown 抑制同 instance 其他 warning。
-
-**Q31. 静默和抑制区别？**
-> 静默：**手动**创建时间窗口内屏蔽（维护）；抑制：**规则驱动**告警之间的相关屏蔽。
-
-**Q32. AM 集群怎么工作？**
-> 多副本 gossip 协议同步状态（已发送、静默列表）。无外部协调依赖。Prometheus 高可用发相同告警，AM 通过指纹去重。
-
-**Q33. AM 集群脑裂了会怎样？**
-> 两组各自发送→重复告警。降低 gossip 超时可缓解，但根本靠网络稳定。
-
-**Q34. 告警去重是怎么做的？**
-> 告警指纹 = labels 的 hash。相同指纹 AM 只发一次。多个 Prometheus 发相同告警到 AM 集群，AM 去重。
-
-**Q35. 告警通知模板怎么写？**
-> `annotations.summary` / `description` 用 Go template，`{{ $labels.xxx }}` 引用 label，`{{ $value }}` 当前值。支持函数 `humanizeDuration` 等。
-
-### 【Remote / Federation】
-
-**Q36. Remote Write 是什么？**
-> Prometheus 采集的每样本实时推到远程存储（VM / Thanos）。协议：Snappy Protobuf HTTP POST。**生产标配**。
-
-**Q37. Remote Read 用吗？**
-> 少用，性能差。推荐直接查远程（如查 vmselect 而不是通过 Prometheus）。
-
-**Q38. Federation 和 Remote Write 区别？**
-> Federation：Prometheus 拉另一 Prometheus 的聚合指标（还是 Pull）；Remote Write：实时推样本到远程。**推荐 Remote Write**。
-
-**Q39. Agent Mode 是什么？**
-> 2.30+ 无本地存储，只做采集 + remote_write。适合超大规模边缘采集，只把数据发中心。
-
-### 【生产实践】
-
-**Q40. Prometheus 单机能扛多少 series？**
-> 官方经验 100~500 万 series 舒服，1000 万勉强。**超过靠 VM / Thanos / Cortex**。
-
-**Q41. Prometheus 高可用怎么做？**
-> 两个相同配置的 Prometheus 各自采集，remote_write 到中心 VM，AM 集群去重。
-
-**Q42. 磁盘满了会怎样？**
-> 停止写入 series（读还行）。监控 `prometheus_tsdb_lowest_timestamp` 和 disk usage 告警。
-
-**Q43. WAL Corruption 怎么处理？**
-> 启动时报错。删除 wal 目录（丢失最近样本）或 downgrade 版本。生产 remote_write 后 WAL 丢失影响小。
-
-**Q44. 采集间隔 scrape_interval 怎么设？**
-> 通用 15~30s。业务敏感 5~10s。**注意 rate 窗口要 ≥ 3~4 倍 scrape_interval**。
-
-**Q45. 抓取超时 scrape_timeout 怎么设？**
-> < scrape_interval。默认 10s。target 慢的话 exporter 优化或调长（但抓取过慢挤压 CPU）。
-
-### 【场景与选型】
-
-**Q46. Prometheus vs Zabbix？**
-> Zabbix：Push 为主，传统监控，agent 复杂，UI 强；Prometheus：Pull + 云原生 + PromQL + K8s 无缝。**云原生首选 Prometheus**。
-
-**Q47. Prometheus vs InfluxDB？**
-> Prometheus：拉模式 + PromQL + 云原生生态；InfluxDB：推模式 + Flux/InfluxQL + 商业版能力多。**监控场景选 Prometheus，通用时序选 InfluxDB**。
-
-**Q48. Prometheus vs VictoriaMetrics？**
-> VM 是 Prometheus 的**长期存储 + 高性能替代**。协议兼容 Prometheus，写入 20x 快，压缩省 7x。**TCUM 生产：Prometheus 采集 + VM 存储**。
-
-**Q49. 为什么 K8s 组件都提供 /metrics？**
-> Prometheus 生态标准。kube-apiserver / kubelet / etcd / kube-state-metrics 都原生支持。集成成本零。
-
-**Q50. 告警最佳实践 5 点？**
-> ① for 至少 2min 避抖动 ② group_by 合并同类 ③ severity 分级不同通道 ④ runbook 链接指导 on-call ⑤ 定期演练 + 告警治理（无效告警下线）。
-
-### 【补充深度】
-
-**Q51. Native Histogram 是什么？**
-> 2.40+ 新型直方图，bucket 自动指数划分。相比经典 Histogram 存储省 8~10x，精度更高。**未来趋势，但生态兼容还在推进**。
-
-**Q52. Prometheus 有鉴权吗？**
-> 内建有 basic auth / TLS。多租户/复杂 ACL 用**反向代理**（nginx / OpenResty / Gateway）或 Cortex/Mimir 多租户。
-
-**Q53. Grafana 里 Prometheus 慢查询怎么优化？**
-> ① Recording Rule 预计算 ② 减小时间范围 ③ 用 label 精确过滤 ④ 避免 `.*` 正则 ⑤ 避免 `count(...)` 大范围。
-
-**Q54. PromQL 里 sum(rate(x[5m])) by (job) 慢怎么办？**
-> Recording Rule 预计算 → 查询变简单 `job:x:rate5m{job="..."}`。
-
-**Q55. Prometheus 采集敏感数据 label 怎么脱敏？**
-> metric_relabel_configs 里 `action: labeldrop` 或 `regex` 匹配删除。或 target 侧脱敏。
+- `01-项目专题/02-监控可观测/01-机制原理/04-机制篇-告警链路与SLO.md`
+- `01-项目专题/02-监控可观测/03-项目题库/08-36问-一致性告警与运营.md`
 
 ---
 
-## §17 · 短板与坑
+## 十二、Dashboard Agent 的 PromQL 质量门禁
 
-1. **单机存储上限**：靠 VM/Thanos 补
-2. **高基数灾难**：把动态值当 label 秒挂
-3. **rate/sum 顺序**：sum(rate(...)) 而非反过来
-4. **深查询卡死**：Grafana 查 30 天 * 1w series → OOM
-5. **PG 陷阱**：不持久 + 历史残留
-6. **无原生鉴权**：靠反代
-7. **Federation 不适合大规模**：用 Remote Write
-8. **AM 分组配置陷阱**：group_wait / repeat_interval 不合理导致告警海啸或告警不到
-9. **规则文件 reload 失败静默**：监控 `prometheus_rule_evaluation_failures_total`
-10. **本地 SSD 坏 = 数据丢**：remote_write 保底
+生成 Grafana 大盘的 Agent 不应只由 LLM judge 打分。合理顺序是：
 
----
+1. 模板变量归一化，识别 `$__rate_interval`、`$cluster`、`${namespace:regex}`；
+2. 使用锁定版本的官方 Prometheus parser 做语法验证；
+3. 静态语义检查：metric/label 是否存在、counter 是否使用 rate、向量匹配是否合理；
+4. 在安全只读环境执行 instant/range query；
+5. 检查结果非空、series/points 上限、超时与错误；
+6. 检查 dashboard JSON、panel 类型、单位、legend、变量引用；
+7. LLM judge 只评估可读性、解释质量和业务覆盖。
 
-## §18 · 面试话术模板
+无法解析的模板变量不能直接判 PromQL 错，应返回 `unresolved_template/inconclusive`。具体 scorer_skill 设计见：
 
-### 3 分钟自述
-
-> "我在 TCUM 全链路里 Prometheus 承担采集协议标准 + 边缘评估，Alertmanager 承担告警路由 + 分组 + 抑制，VictoriaMetrics 承担长期存储。
->
-> **对 Prometheus 最深三点理解**：
-> - **多维 label + Pull + PromQL 是生态标准**：K8s/CNCF 全适配。VM/Thanos/Cortex 都兼容 Prometheus 协议就是明证。
-> - **TSDB 内核精妙但单机上限硬**：WAL + Head + Block + XOR 压缩样本几字节；但 series 超 500w 就吃力，横向不能扩，长期必须 remote_write 到 VM。
-> - **告警的三层设计**：Prometheus 生成 firing → Alertmanager 分组抑制静默路由 → 通知集成。**Alertmanager 集群 gossip 去重是天才设计**：Prometheus HA 发相同告警 AM 自动收敛。
->
-> **生产血泪**：把 user_id 打进 label 秒挂内存、sum(rate) 写反得负值、group_wait 太短告警海啸、深查询 Grafana 卡死——每一次都是模型和 PromQL 理解的教训。"
-
-### 反问 5 问
-
-1. Prometheus 版本？开 Native Histogram 了吗？
-2. 长期存储用 VM / Thanos / Mimir？
-3. AM 集群规模？分组策略？
-4. 高基数控制机制？series 上限告警吗？
-5. 告警响应流程和 runbook 建设？
+- `01-项目专题/03-TCUM-AI/01-机制原理/05-机制篇-Agent评测与评测体系.md`
 
 ---
 
-**本篇完 · 约 26KB · 覆盖架构/TSDB/PromQL/Rule/AM/生产实战/55 问**
+## 十三、项目事实边界
 
-**证据基线**：
-- Prometheus 官方文档：https://prometheus.io/docs/
-- Facebook Gorilla 论文（XOR 编码）
-- 生产实战：TCUM Prometheus + VM + AM 集群 + 分级告警
-- 阿里/字节 K8s 集群规模：单集群万 pod，Prometheus + VM 承载
+| 命题 | 仓库证据 | 面试表达 |
+|---|---:|---|
+| TCUM 使用 Prometheus AST 与 PromQL engine | 有 | 可讲真实执行链路 |
+| 按指标元数据路由存储 proxy | 有 | 可讲统一查询抽象 |
+| 支持 InfluxDB、ClickHouse、默认存储路径 | 有 | 具体能力以各 proxy 为准 |
+| 跨存储表达式完整支持 | 无，且源码有 TODO | 明确说当前短板 |
+| 长 range 超过 24h 会拒绝 | 无，只日志提醒 | 不声称有硬保护 |
+| 使用 VictoriaMetrics 接口 | 有 | 不等于能证明全部部署拓扑 |
+| 使用 Thanos/Cortex/Mimir | 无 | 只作为行业选项 |
+| 固定三节点 Alertmanager | 无 | 不写成项目事实 |
+| 固定性能倍数/series 上限 | 无 | 不报未经压测数字 |
+
+---
+
+## 十四、面试高频 30 问
+
+### Q1：Prometheus 为什么通常用 Pull？
+
+中心控制频率和超时、天然生成目标健康信号，并让目标只需暴露 endpoint。
+
+### Q2：Pushgateway 适合什么？
+
+有限的短生命周期批任务。它会成为集中点，失去 `up` 语义，旧 series 需要显式删除。
+
+### Q3：什么定义一条 series？
+
+metric name 与完整 label set。
+
+### Q4：为什么不能把 trace_id 放 label？
+
+值域近乎无界，会持续创建 series，放大内存、索引、存储、查询和 remote write。
+
+### Q5：Counter 为什么用 rate？
+
+Counter 表示累计值，rate 估计窗口内每秒变化并处理 reset。
+
+### Q6：为什么先 rate 后 sum？
+
+每条原始 series 的 reset 必须先被识别；先求和会掩盖单实例重启。
+
+### Q7：Range query 是什么？
+
+在 start 到 end 的多个 step 时间点重复评估 instant expression。
+
+### Q8：PromQL 空结果等于 0 吗？
+
+不等于。空结果可能是 matcher、时间、staleness 或采集问题；0 是存在样本的数值。
+
+### Q9：many-to-many 怎么修？
+
+先明确业务连接键并聚合到一侧唯一，再使用正确的 on/ignoring 与必要 group modifier。
+
+### Q10：Histogram 与 Summary 怎么选？
+
+需要跨实例聚合通常选 Histogram；Summary quantile 通常不能聚合，Histogram 精度依赖 bucket。
+
+### Q11：Recording rule 的作用？
+
+周期性预计算昂贵/高频表达式，换取查询稳定，但增加 series 和评估成本。
+
+### Q12：`for` 解决什么？
+
+条件持续一段时间才 firing，过滤短暂抖动；不等于替代合理窗口和 SLO 设计。
+
+### Q13：Alertmanager 做什么？
+
+分组、路由、抑制、静默、重试通知，不负责计算 PromQL 条件。
+
+### Q14：Alertmanager HA 会严格只发一次吗？
+
+不会。其分区策略 fail-open，宁可重复也尽量不漏，目标是至少一次。
+
+### Q15：Remote Write 等于远端已可查询吗？
+
+不等于。远端接收、持久化、索引与查询可能有延迟。
+
+### Q16：副本 Prometheus 如何避免告警丢失？
+
+多个实例独立评估并向全部 Alertmanager 实例发送；Alertmanager基于通知状态降重，但仍允许重复。
+
+### Q17：如何估算 range query 成本？
+
+核心是 matched series × 时间范围/step，再结合函数、subquery、聚合和存储扫描。
+
+### Q18：查询超时为什么要向下游传播？
+
+否则上游已取消，底层存储仍继续扫描，浪费资源并造成雪崩。
+
+### Q19：TCUM PromQL 如何选存储？
+
+解析 AST、提取指标名，再通过 proxy manager 按指标元数据选择查询代理。
+
+### Q20：TCUM 的结果是 Langfuse 返回的吗？
+
+不是。执行结果来自 PromQL 服务和存储 proxy；Langfuse如果接入，主要记录 Agent/LLM trace 与观测数据。
+
+### Q21：为什么复用官方 parser？
+
+保证语法语义与 Prometheus 版本对齐，避免用正则伪解析完整语言。
+
+### Q22：converter fallback 有什么风险？
+
+自动改写可能改变语义；必须记录改写、做 AST/corpus 回归，并在不确定时拒绝。
+
+### Q23：TCUM 当前跨存储表达式的边界？
+
+源码明确 TODO；当前以一个指标名选 proxy，不能称为完整跨源执行器。
+
+### Q24：SLO 为什么拆 PromQL 分片？
+
+缩小单条 regex 与底层扫描范围，再用有界并发降低总延迟。
+
+### Q25：部分分片失败为什么危险？
+
+返回 nil error 可能让调用方把残缺数据当完整。协议应显式携带 completeness 和失败分片。
+
+### Q26：TCUM 长范围查询保护够吗？
+
+目前超过 24h 主要是日志提醒；应增加点数估算、租户预算、降采样和拒绝策略。
+
+### Q27：TCUM 为什么还做一层静默？
+
+为了按租户和领域策略统一匹配、审计和历史留存；需要治理与 Alertmanager silence 的双层语义。
+
+### Q28：如何验证 Agent 生成的 PromQL？
+
+模板归一化、官方 parser、元数据语义检查、安全执行和资源预算；LLM judge 只做主观质量补充。
+
+### Q29：如何发现告警规则慢？
+
+监控评估时长、失败、missed iterations、输出 series/alerts 与数据可用延迟。
+
+### Q30：如何降低告警噪声？
+
+从影响出发设计规则，合理 for/window，聚合实例 labels，用 inhibition 表达依赖，并以响应行动数据持续复盘。
+
+---
+
+## 十五、项目表达模板
+
+> TCUM 把 PromQL 作为多时序存储的统一查询语言。请求先用官方 parser 生成 AST，提取指标并通过元数据选择 InfluxDB、ClickHouse 或默认存储 proxy，再由 PromQL 引擎执行。这个抽象让上层不感知存储，但跨存储表达式目前仍是明确 TODO，不能夸大成完整联邦查询。性能上我们已有 SLO label 分片和并发上限，但我会进一步把部分失败显式化，并用 matched series × range/step 做查询预算。告警侧，Alertmanager负责分组路由，TCUM webhook 后还有租户级静默和历史留存，静默告警仍保留审计记录。对于 Agent 生成 PromQL，我会用官方 parser、元数据和安全执行做确定性门禁，Langfuse只负责 trace，不作为查询结果来源或语法裁判。
+
+---
+
+## 十六、源码与官方资料
+
+### 项目源码
+
+- `/Users/yaao/Documents/code/tcum-yunshao-global/service/bizservice/pqlqueryservice/service.go`
+- `/Users/yaao/Documents/code/tcum-yunshao-global/service/bizservice/pqlqueryservice/proxy-manager/proxy_manager.go`
+- `/Users/yaao/Documents/code/tcum-yunshao-global/service/integration/promql-proxy/`
+- `/Users/yaao/Documents/code/tcum-yunshao-global/service/bizservice/sloservicev2/slov2_promql_shard.go`
+- `/Users/yaao/Documents/code/tcum-yunshao-global/service/bizservice/alarmservice/alarm_rule_service.go`
+- `/Users/yaao/Documents/code/tcum-yunshao-global/service/bizservice/alertservice/alert_service.go`
+- `/Users/yaao/Documents/code/tcum-yunshao-global/service/cache/alarmcache/silence_runtime.go`
+
+### Prometheus 官方文档
+
+- [Querying basics](https://prometheus.io/docs/prometheus/latest/querying/basics/)
+- [Storage](https://prometheus.io/docs/prometheus/latest/storage/)
+- [Recording and alerting rules](https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/)
+- [Alerting overview](https://prometheus.io/docs/alerting/latest/overview/)
+- [Alertmanager configuration](https://prometheus.io/docs/alerting/latest/configuration/)
+- [Alertmanager high availability](https://prometheus.io/docs/alerting/latest/high_availability/)
+- [Metric and label naming](https://prometheus.io/docs/practices/naming/)
+- [When to use Pushgateway](https://prometheus.io/docs/practices/pushing/)

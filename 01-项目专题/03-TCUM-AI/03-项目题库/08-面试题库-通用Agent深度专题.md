@@ -642,9 +642,11 @@ POST /v1/responses
 
 # 第三部分 · 四条套娃追问链 & Agent 自进化专题
 
-> **本部分定位**：面试深度追问弹药库。原 `14-套娃追问与Agent自进化专题.md` 全部内容，未做任何删减。**建议先掌握第一/二部分的通用回答，再用本部分应对"你说的 A 是怎么做的？B 是怎么做的？"式套娃追问**。
+> **本部分定位**：面试深度追问弹药库，也是 A～D 四条追问链的唯一现行正文。内容已按当前 deepseek-harness 源码修正，不追求保留旧稿中未经验证的数字和机制猜测。**建议先掌握第一/二部分的通用回答，再用本部分应对“你说的 A 是怎么做的？B 是怎么做的？”式套娃追问。**
 
 ## 第一部分 · 四条套娃追问链
+
+<a id="deep-dive-a"></a>
 
 ### 链 A · KV Cache 的追问（8 层）
 
@@ -692,6 +694,8 @@ POST /v1/responses
 
 ---
 
+<a id="deep-dive-b"></a>
+
 ### 链 B · 上下文管理与 Compaction 的追问（7 层）
 
 **B0（root）**：Agent 上下文快满了怎么办？
@@ -720,7 +724,7 @@ POST /v1/responses
 - 弱答：`不会`；
 - 强答：**会**——这就是 LLM 的"电报游戏效应"。工程解法：
   - **保留 raw checkpoint**：摘要时**同时保留一份原始事件到本地**（不进上下文，进磁盘），需要时可加载子片段；
-  - **禁止摘要摘要**：dsh 的 checkpoint 事件带 `originalRange: [seq_lo, seq_hi]`，二次压缩时**直接跳过已被压缩的区间**，只压缩新事件；
+  - **不要虚构 `originalRange`**：当前 dsh compaction 会追加带 `surfaceOp: { op: 'replace', start, end }` 的摘要节点，旧事件仍保留在 raw log，但从当前 model-visible surface 中被遮蔽；后续压缩基于当前 surface 重新选择安全区间，因此通常操作的是“摘要节点 + 后续消息”，并不等于系统禁止再次压缩旧摘要。递归摘要失真仍需要质量评测和按需回看 raw log；
   - **摘要错误自愈**：模型下次读文件发现和摘要冲突时，会主动更正；dsh 的 `fs/observed` 事件（`packages/skill/skill-filesystem/src/index.ts:139` 里 `ctx.on('fs/observed', ...)`）就是这个机制——**注意它不是通用事件**，而是 `skill-filesystem` 包自己声明合并的事件类型、仅当你装了这个 skill 时存在。
 
 **B5**：你说 tool_result 剪枝——一个文件读了两次结果不一样（比如中间被改过），你剪掉旧的会不会误导模型？
@@ -740,6 +744,8 @@ POST /v1/responses
   dsh 用户完全可以自己实现"Responses-API-like 服务端接续"——只需一个 stateless 代理保存日志——但**主动权在客户端**，这就是可观测性带来的架构选择自由。
 
 ---
+
+<a id="deep-dive-c"></a>
 
 ### 链 C · "一切皆插件" 的追问（8 层，dsh 核心）
 
@@ -764,7 +770,7 @@ POST /v1/responses
   2. 分配新 fiber，调用 `apply(ctx)` 或 Service 构造函数；
   3. 服务通过 `ctx.provide(name, impl)` 注册到 fiber-local store；
   4. 挂载完成，parent 的 `ctx.get(name)` 可见。
-  并发：Cordis 的 fiber 是**协程语义**（非 OS 线程），每个 fiber 里操作序列化；跨 fiber 通过服务代理（`ctx.reflect`）访问，代理走全局 service store，不受 fiber 拓扑影响。**这在 postmortem 0001 里踩过大坑**：跨 fiber 传递的可追踪代理在 root fiber 上找不到 service——后来靠 `ctx.reflect.get(name, false)` 直接查全局 store 绕过。`[docs/postmortem/0001-acp-default-export-drops-inject.zh.md]`
+  并发边界要说准确：fiber 是**插件生命周期和依赖作用域**，不是替你串行化所有异步任务的协程调度器；共享状态仍需由具体 Service 自己保证一致性。服务属性代理默认沿当前 fiber/祖先解析，**会受拓扑和 shadow 影响**。`postmortem-0001` 的真实修复是：声明依赖的服务继续用属性访问；机会性读取、未在 `inject` 中声明的兄弟服务改用拓扑无关且保留活性检查的 `ctx.get(name)`，不是笼统地说所有代理都走全局 store。
 
 **C4**：事件的 4 种分发模式（emit / waterfall / parallel / serial）怎么选？举例说明。
 - 强答（[docs/cordis-primer.zh.md#dispatch-modes](/Users/yaao/Documents/code/AI-agent/deepseek-harness/docs/cordis-primer.zh.md)）：
@@ -780,20 +786,20 @@ POST /v1/responses
 - 强答：**短路是 by design**——策略型 listener（如权限拒绝、缓存命中）应该短路。**观察型 listener 必须调 `next()` 委托**，否则会静默吞掉下游。dsh 的 [postmortem-0002](/Users/yaao/Documents/code/AI-agent/deepseek-harness/docs/postmortem/0002-js-expression-disabled-filesystem-tools.zh.md) 就是踩过一次：一个配置里的 `!!js` 表达式解析错误，导致 filesystem-tools 的 listener 短路了整个工具注册链。后来通过 loader-configuration 规范 + AGENTS.md 规则杜绝再次发生。
 
 **C6**：`inject` 声明依赖，如果 A 依赖 B，B 依赖 A，怎么办？
-- 强答：**Cordis 直接死锁**（fiber 永远等不到 ready）。解决：
-  1. 用 lazy 服务代理——`ctx.reflect.get('B', false)` 不阻塞挂载，运行时再拿；
-  2. 拆分成三个：A、B 都依赖 C，C 是共享抽象；
-  3. 从设计上避免——dsh 里的服务图是 DAG（[docs/cordis-api/context.zh.md](/Users/yaao/Documents/code/AI-agent/deepseek-harness/docs/cordis-api/context.zh.md)），有 `dsh-dependency-check` gate 静态检测循环依赖。
+- 强答：这类循环依赖会让相关 entry 无法进入 active，而不是可以正常工作的依赖图。解决：
+  1. 首选依赖倒置：拆分成三个，A、B 都依赖 C，C 是共享契约或能力 seam；
+  2. 如果 B 真的是可选能力而非 A 的启动前提，A 不声明强依赖，只在实际调用点用 `ctx.get('B')` 查询并处理不存在；不能在 `apply` 阶段假装 B 已就绪；
+  3. 启动时 fail loud——`app-boot` 的 `assertEntriesLoaded/assertEntriesActivated` 会报告没有 fiber、加载失败和 pending entry 的 unresolved services，避免应用带着未激活插件继续运行。当前仓库没有名为 `dsh-dependency-check` 的静态循环依赖 gate，不能在面试中这样宣称。
 
 **C7**：插件卸载（`fiber.dispose()`）时怎么保证资源清理干净？漏掉一个 timer 会怎样？
 - 强答：**`ctx.effect()` 强制返回 disposer**——注册副作用时必须给回收函数（unregisterFn / clearTimeout / socket.close），Cordis 在 dispose 时逆序调用。漏掉：
   - 内存泄漏（listener 引用父 fiber 阻止 GC）；
   - "僵尸"响应（disposed plugin 的 hook 仍触发）；
-  - dsh 通过 [`docs/defensive-patterns.zh.md`](/Users/yaao/Documents/code/AI-agent/deepseek-harness/docs/defensive-patterns.zh.md) 规范 + CI lint 检查每个 `ctx.on` 必须在同一 scope 内有对应 disposer。
+  - 当前仓库主要靠 Cordis 生命周期 API、包级测试和 review 约束清理；没有发现“每个 `ctx.on` 必须在同一 scope 配 disposer”的专门 CI lint。准确说法是：优先使用 `ctx.effect()`、`ctx.on()` 或返回 disposer 的官方注册 API，把资源所有权绑定到 fiber；关键后台任务再补 teardown 测试。
 
 **C8**：一切皆插件的**代价**是什么？为什么 Claude Code / Codex 不这么做？
 - 强答：**代价三方面**：
-  1. **启动开销**：每次挂载 fiber、resolve inject、type-check，冷启动比硬编码慢 5-10x；
+  1. **启动和治理开销**：每次挂载都要解析依赖、建立 fiber、等待激活并审计 pending/failed entry；源码能证明路径更长，但当前材料没有可支持“冷启动慢 5～10 倍”的 benchmark，不能给这个数字；
   2. **类型系统复杂**：`ctx.tools` 类型要靠 TS 声明合并（declaration merging）动态扩展，出错难 debug；
   3. **调试链路长**：一个 tool 调用穿过 5 层 waterfall、3 个服务代理，栈追踪很深。
   Claude Code / Codex 的内核更强调稳定产品体验和受控扩展：Codex 将 Skill、MCP、Hook、Plugin、App Server 协议作为扩展面，而不是把每个核心子系统都暴露为可热挂卸插件。dsh 定位更接近可重组的 Agent 平台，二者是**扩展边界选择**而非技术优劣；不要再说 Codex“不追求二次开发”。
@@ -878,13 +884,15 @@ agent.ctx.on('agent/pre-step', listener)
 
 ---
 
+<a id="deep-dive-d"></a>
+
 ### 链 D · 长程任务可靠性追问（7 层）
 
 **D0（root）**：agent 跑一个 3 小时的任务，中间进程崩了怎么办？
 
 **D1**：怎么恢复？重跑还是续跑？
 - 弱答：`重跑`；
-- 强答：**续跑**。dsh 用 **Event Sourcing** 模式：`session.jsonl` 是唯一真源，进程 = 事件日志的纯函数。重启时 `SessionPersistence` 从磁盘读回事件序列，作为 `SessionOptions.seed` 传给新 `Session` 构造器（`SessionOptions.seed: readonly SessionEvent[]`，`packages/core/session/src/types.ts:108`），`seedSource='persistence'` 标识；`request/header` 里的 `reason: 'resume'` 明确标记恢复边界。`[docs/subsystems/session.zh.md]`
+- 强答：**会话状态续跑，外部副作用重新取证**。dsh 用 Event Sourcing 保存 append-only Session log；重启时 `SessionPersistence` 读回事件序列作为 seed，新生命周期用 `session/end-seed` 标出 seed/live 边界，后续模型请求用 `request/header reason:'resume'` 记录恢复。它能确定性重建消息表层、turn/step/tool 边界和日志投影，但整个 Agent 进程不是纯函数：LLM 输出、工具副作用和外部服务状态仍需幂等键、状态检查或人工确认。
 
 **D2**：一个工具执行了一半（比如 bash 跑了 30 秒生成了半个文件）崩了，怎么恢复？
 - 弱答：`重新执行`；
@@ -1265,5 +1273,5 @@ step N+1: model reads hint → decides new strategy → new tool_call
 - KV Cache：**前缀字节稳定 = 架构级不变量**；
 - 上下文管理：**摘要 + 剪枝 + 分层记忆，永不滑窗**；
 - 一切皆插件：**Cordis fiber tree + 4 种事件分发 + inject 声明依赖**；
-- 长程可靠性：**Event Sourcing，进程 = 事件日志的纯函数**；
+- 长程可靠性：**Event Sourcing 重建会话状态，副作用靠幂等与外部取证恢复**；
 - 自进化：**agent.inject → todo/write → cordis_define，从注入到进度到写代码**。
