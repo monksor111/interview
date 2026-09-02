@@ -1511,18 +1511,251 @@ flowchart LR
 
 优先入集的触发信号：用户明确纠正、低评分反馈、工具错误后仍给强结论、写操作、超预算、重试风暴、Agent 转交失败、模型拒答、长对话摘要后质量下降。每次入集要保留“为什么入集”：它对应哪种 failure taxonomy，是否已修复，修复所关联的 PR/Skill 版本是什么。这样还能反向度量团队：过去一个月新增了多少失败样本、其中多少在下一次类似变更中被成功拦截。
 
-## 5.6 多 Agent 特有评测：不只评最终汇总
+## 5.6 多 Agent 特有评测：Supervisor 的意图识别不能只看分类 Accuracy
 
-对 supervisor / sub-agent 体系，新增 Agent 不一定提升质量，常见后果是重复查询、上下文丢失、委派循环和谁都不负责最终结论。多 Agent Eval 应在整体结果外单独检查：
+对 supervisor / sub-agent 体系，新增 Agent 不一定提升质量，常见后果是重复查询、上下文丢失、委派循环和谁都不负责最终结论。更容易犯的错误，是把 Supervisor 当成普通的单标签意图分类器，只统计“选中的 Agent 是否等于标准 Agent”。实际决策链是：
 
-- 任务分类是否应当委派；低复杂任务是否被无意义拆分；
-- 委派输入是否包含最小充分上下文（目标、已知事实、时间范围、资源范围）；
-- 子 Agent 是否确实覆盖了互补证据，而不是查同一数据；
-- 汇总 Agent 是否引用子 Agent 的证据、是否解决了矛盾；
-- 最大委派深度、并发数、总 token、总工具次数是否守预算；
-- 子 Agent 失败时，主 Agent 是否诚实降级而不是编造结论。
+```text
+用户意图
+→ 应该直答 / 澄清 / 拒绝 / 委派
+→ 委派给一个还是多个子 Agent
+→ 如何拆分、按什么依赖顺序调用
+→ Handoff 参数是否保留了用户目标和约束
+→ 最终任务是否真的完成
+```
 
-一个很实用的指标是 **marginal evidence gain**：每次委派新增了多少最终被引用的独立证据，除以该委派增加的 token/时延。若大量子 Agent 只产出未被采用的自然语言，多 Agent 只是昂贵的“自我讨论”。
+因此 Supervisor Eval 应拆成 **决策评测、路由评测、Handoff 评测、轨迹评测、结果评测** 五层。路由正确不代表子 Agent 执行正确，最终结果错误也不一定是 Supervisor 路由错误；不拆层就无法归因。
+
+### 5.6.1 先把“意图识别结果”定义成结构化决策
+
+建议统一记录如下决策对象，而不是事后从最终回复猜意图：
+
+```json
+{
+  "decision": "multi_delegate",
+  "intents": ["metric_discovery", "dashboard_generation"],
+  "targets": ["prometheus_promql_expert", "grafana_dashboard_expert"],
+  "task_plan": [
+    {
+      "id": "t1",
+      "target": "prometheus_promql_expert",
+      "task": "确认支付服务的请求量、错误率和延迟指标"
+    },
+    {
+      "id": "t2",
+      "target": "grafana_dashboard_expert",
+      "task": "使用已确认指标生成并验证 Grafana 大盘",
+      "depends_on": ["t1"]
+    }
+  ],
+  "required_context": {
+    "tenant_id": "t1",
+    "service": "payment-service",
+    "environment": "production"
+  }
+}
+```
+
+`decision` 至少要覆盖：
+
+| 决策 | 含义 |
+| --- | --- |
+| `respond` | 主 Agent 可直接回答，不应浪费一次委派 |
+| `clarify` | 关键信息不足，先向用户补问 |
+| `delegate` | 委派单个专业 Agent |
+| `multi_delegate` | 拆成多个互补子任务，可串行或并行 |
+| `reject` | 因权限、安全或政策边界拒绝 |
+| `out_of_scope` | 当前 Agent 集合不具备该能力 |
+
+例如“给 payment-service 创建线上大盘”缺少租户、数据源、环境确认和发布授权时，正确决策可能是 `clarify`，而不是立即调用 Grafana Agent。只标一个 `grafana_dashboard_expert` 会把这种安全错误误判成路由正确。
+
+### 5.6.2 六组指标：不要让一个总准确率掩盖风险
+
+#### A. 决策类型
+
+- `Decision Accuracy`：适合总体概览；
+- `Macro-F1` / 每类 Precision、Recall：防止高频 `delegate` 类掩盖少数但关键的 `clarify/reject`；
+- 混淆矩阵：直接看过度委派、漏澄清和误拒绝发生在哪里。
+
+生产门禁应优先关注 `clarify`、`reject` 的 Recall，而不是只看总体 Accuracy。
+
+#### B. 单 Agent 与多 Agent 路由
+
+单选路由报告 `Top-1 Accuracy、Macro-F1`；若路由器先召回候选再由主模型选择，可增加 `Top-K Recall/MRR`。多 Agent 场景则报告：
+
+```text
+Agent Precision = 正确调用的 Agent 数 / 实际调用的 Agent 数
+Agent Recall    = 正确调用的 Agent 数 / 应调用的 Agent 数
+Agent F1        = Precision 与 Recall 的调和平均
+Jaccard         = 实际集合与期望集合的交集 / 并集
+Exact Set Match = Agent 集合是否完全一致
+```
+
+Precision 低表示乱调无关 Agent，Recall 低表示漏掉必要 Agent；两者业务含义不同，不能只留一个总分。
+
+#### C. 澄清、拒识与越权
+
+- `Clarification Precision/Recall`；
+- `Unnecessary Clarification Rate`：信息充分却反复问用户；
+- `Missing Clarification Rate`：信息不足却直接执行；
+- `Out-of-Scope Recall`、`False Acceptance/False Rejection Rate`；
+- `Unauthorized Route Rate`；
+- `Destructive Action Without Confirmation Rate`。
+
+澄清内容不要按整段文本相似度打分，而应将缺失信息标成 slot，用字段级 Precision/Recall 判断“问到了必须补充的内容吗”。
+
+#### D. Handoff 参数与上下文保真
+
+选对 Agent 但只委派“帮用户生成大盘”仍是失败。应检查：
+
+- `Required Slot Recall`：tenant、service、environment、time range 等是否传全；
+- `Slot Value Accuracy`：值是否正确，而不是只检查字段存在；
+- `Constraint Preservation Rate`：用户的只读、时间、范围和输出要求是否保留；
+- `Sensitive Context Leakage Rate`：是否把无关租户或秘密传给子 Agent；
+- `Task Description Faithfulness`：委派目标有没有被改写或缩窄。
+
+前四项优先用确定性程序判定；只有自然语言任务包的语义保真再交给经过人工校准的 Judge。
+
+#### E. 任务分解与执行轨迹
+
+正确路径通常不唯一，不应默认用一条 Golden Trace 做全序 Exact Match。Case 应表达约束：
+
+```json
+{
+  "required_agents": ["prometheus_promql_expert", "grafana_dashboard_expert"],
+  "optional_agents": ["cmdb_expert"],
+  "forbidden_agents": ["alarm_rule_writer"],
+  "ordering_constraints": [
+    ["prometheus_promql_expert", "grafana_dashboard_expert"]
+  ],
+  "max_agent_calls": 4
+}
+```
+
+分别计算必要 Agent 覆盖率、多余调用率、禁止调用率、偏序约束满足率、重复委派率、循环率和预算超限率。严格变更流程可以用 exact/in-order；开放式诊断更适合 required set + partial order。Vertex Agent Evaluation 同时区分 final response 与 trajectory，并提供 exact、in-order 等轨迹视角，这说明 LCS 只是轨迹评测的一种，不是意图准确率本身。
+
+#### F. 最终结果与条件成功率
+
+必须同时记录：
+
+```text
+Route Correctness
+Task Success Rate
+P(Task Success | Route Correct)
+Recovery Rate
+```
+
+若路由正确但条件成功率低，问题主要在子 Agent；若第一步就路由错误，问题在 Supervisor；若路由错误仍经常成功，则说明 Agent 能力边界重叠，应先治理 Agent Card/Profile，而不是继续调 Prompt。
+
+### 5.6.3 Gold Case 不应只保存一个 Agent 名
+
+推荐结构：
+
+```json
+{
+  "case_id": "supervisor-route-001",
+  "messages": [
+    {"role": "user", "content": "给 payment-service 生成线上 Grafana 大盘"}
+  ],
+  "expected": {
+    "acceptable_decisions": ["clarify"],
+    "required_missing_slots": ["tenant_id", "datasource", "publish_mode"],
+    "acceptable_agents_after_clarification": ["grafana_dashboard_expert"],
+    "required_agents": [],
+    "optional_agents": [],
+    "forbidden_agents": ["alarm_rule_writer"],
+    "must_not_have_side_effect": true
+  },
+  "tags": ["clarification", "grafana", "production", "missing-context"],
+  "risk_level": "high"
+}
+```
+
+存在多条合理路径时存“可接受决策集合 + 必要/可选/禁止集合 + 偏序约束”，而不是强制唯一标准轨迹。
+
+Case 也不应全靠人逐条凭空编写，推荐四路汇集：
+
+1. **生产 Trace 抽样**：用户纠正、重新路由、多次澄清、子 Agent 失败恢复、高成本和高风险 Trace，脱敏后由领域专家标注；
+2. **能力边界组合**：根据 Agent 的 `profile/use_cases/skills` 生成典型正例、近邻混淆、多意图、缺信息、越界和上下文依赖 Case；
+3. **线上错误回流**：每个确认的误路由转成回归 Case，关联 failure taxonomy 与修复版本；
+4. **对抗扰动**：同义改写、口语错别字、中英混合、否定、指代、长上下文、Prompt Injection；合成样本必须人工抽检。
+
+切分 Dataset 时按时间、用户/租户和语义簇隔离，避免同一问题的改写同时进入训练/调参集与测试集。模型具有随机性，关键 Case 应重复运行 N 次并报告均值、方差和严重失败率。
+
+### 5.6.4 两个评分时点：第一步决策与完整 ReAct 分开
+
+```text
+Supervisor 产生第一次结构化决策 / 第一次 Agent Tool Call
+    → 立即评 decision、target、clarification、handoff arguments
+
+完整 ReAct / 多 Agent 流程结束
+    → 再评 trajectory、recovery、final state、cost/latency
+```
+
+第一阶段不必等待子 Agent 跑完，否则子 Agent 的执行错误会污染意图识别指标。第二阶段必须等待完整执行和环境断言，才能判断业务成功。看板应并列显示 `Supervisor Decision Eval + Trajectory Eval + Outcome Eval`，不要只合成一个分数。
+
+### 5.6.5 TCUM-AI 应新增确定性 `supervisor_route` Grader
+
+TCUM-AI 当前 `tool_sequence_match` 只比较 candidate 与 baseline 的工具名序列并计算 LCS。它不能作为 Supervisor 意图准确率，因为 Baseline 也可能错、正确轨迹可能不唯一、工具名相同但 `subagent_type/description` 可能错误，也无法识别“本应澄清却直接执行”。建议扩展 `TrialTrace`：
+
+```json
+{
+  "supervisor_decision": "multi_delegate",
+  "available_agents": ["prometheus_promql_expert", "grafana_dashboard_expert"],
+  "agent_profile_versions": {"grafana_dashboard_expert": "sha256:..."},
+  "agent_calls": [
+    {
+      "step": 1,
+      "agent": "prometheus_promql_expert",
+      "arguments": {"tenant_id": "t1", "service": "payment-service"}
+    }
+  ],
+  "clarification": null,
+  "final_outcome": {"success": true, "state_ref": "artifact://..."}
+}
+```
+
+新增五个内置 Grader：
+
+| Grader | 核心判定 |
+| --- | --- |
+| `supervisor_decision` | respond/clarify/delegate/reject 是否正确 |
+| `supervisor_route` | 必要、可选、禁止 Agent 集合与偏序约束 |
+| `delegation_argument` | Handoff 必填字段、值和用户约束是否正确 |
+| `trajectory_constraint` | 调用顺序、重复、循环、深度与预算 |
+| `task_outcome` | Artifact/外部系统最终状态是否达标 |
+
+`supervisor_route` 配置示例：
+
+```json
+{
+  "metric": "supervisor_route",
+  "weight": 3,
+  "config": {
+    "acceptable_decisions": ["multi_delegate"],
+    "required_agents": ["prometheus_promql_expert", "grafana_dashboard_expert"],
+    "optional_agents": ["cmdb_expert"],
+    "forbidden_agents": ["alarm_rule_writer"],
+    "ordering_constraints": [
+      ["prometheus_promql_expert", "grafana_dashboard_expert"]
+    ],
+    "required_argument_fields": ["tenant_id", "service", "environment"],
+    "max_agent_calls": 4
+  }
+}
+```
+
+普通维度可以按“决策 20%、目标 Agent 30%、参数 20%、分解顺序 15%、安全 15%”加权，但禁止 Agent、跨租户泄露、未审批生产变更等必须是 blocker，不能被其他高分抵消。
+
+难以程序判断的任务描述语义保真、分解合理性可交给 custom scorer skill，但必须固定 rubric/模型版本/采样参数，输出证据，并在专家标注集上持续计算 Judge 一致率。
+
+### 5.6.6 线上看板与面试结论
+
+线上至少展示：`Decision Macro-F1、Route Macro-F1、Multi-Agent Route F1、Clarification P/R、Out-of-Scope Recall、Unauthorized Route Rate、Task Success Rate、P(Task Success | Route Correct)、平均 Agent 调用数、P95 路由时延、平均路由 Token`。同时按 Agent 对、风险级别、语言、单轮/多轮和新旧 Profile 版本切片，才能知道退化发生在哪里。
+
+一个很实用的效率指标是 **marginal evidence gain**：每次委派新增了多少最终被引用的独立证据，除以该委派增加的 token/时延。若大量子 Agent 只产出未被采用的自然语言，多 Agent 只是昂贵的“自我讨论”。
+
+> **面试结论**：业界不会只用分类 Accuracy 衡量 Supervisor，而是把它当作带拒识、澄清、多标签路由、参数传递和任务分解的决策系统。离线用人工校验的结构化 Case 分别评第一步决策、完整轨迹和最终结果；线上从 Trace 监控误路由、重试与业务成功，并把确认的失败持续回流为回归集。
 
 ---
 

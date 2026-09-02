@@ -337,6 +337,8 @@ aguiServer, err := einoagui.New(agent,
 | **无断线重连与状态快照** | 子 Agent 流断开则中间结果全丢。应按步骤落快照（Redis），重连后从最后一步继续 | CC `swarm/reconnection.ts` |
 | **无 `filterIncompleteToolCalls`** | 父 Agent 中途派生子 Agent 时可能存在未完成的 `tool_use`，传给子 Agent 会 API 报错 | CC |
 
+Supervisor 路由的完整度量不能只写一个“准确率”：还需要区分直答/澄清/拒绝/委派、多 Agent 集合匹配、Handoff 参数、轨迹约束和最终任务结果。详细的 Case schema、两阶段评分时点、`supervisor_route` scorer 设计及看板指标见 [Agent 评测体系 §5.6](./05-机制篇-Agent评测与评测体系.md#56-多-agent-特有评测supervisor-的意图识别不能只看分类-accuracy)。
+
 ---
 
 # 5. 长程任务可靠性

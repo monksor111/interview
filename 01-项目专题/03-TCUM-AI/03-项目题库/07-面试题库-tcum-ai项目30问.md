@@ -605,9 +605,27 @@
 
 **解决思路**：
 - **O14.1** 三级路由：① 规则前置（含 `PromQL`/`rate(` → prometheus 域；含 `变更单` → change 域）零成本；② 小模型多标签分类输出 `domain + confidence + complexity`；③ `confidence < 阈值` 反问澄清；
-- **O14.2** 积累 200+ 条"用户问题 → 正确域"标注样本纳入 CI，路由改动必跑回归；
-- **O14.3** 路由 trace 记录 `input/domain/confidence/是否被用户纠正`，形成持续优化数据源；
+- **O14.2** 构建结构化路由集，不只标一个“正确域”，还要标 `acceptable_decisions`、必要/可选/禁止 Agent、缺失 slot、Handoff 必填字段和调用偏序；样本来自生产 Trace、Agent 能力边界组合、线上错误回流和对抗改写；
+- **O14.3** 路由 Trace 记录 `decision/available_agents/selected_agents/arguments/profile_versions/是否被用户纠正`，第一步决策后立即评分；完整 ReAct 结束后再评轨迹与业务结果，避免子 Agent 错误污染 Supervisor 指标；
 - **O14.4（新增，成本极低）** **Agent 配置 lint**：入库时校验 `profile` 非空、长度下限、必须包含"何时使用"描述。**在 LLM 驱动路由的架构下，`profile`/`use_cases` 的地位等同于函数的 doc comment——它不是文档，它是被执行的输入。**
+
+**怎么衡量，不能只答 Accuracy**：
+
+| 层次 | 指标 | 解决的问题 |
+| --- | --- | --- |
+| 决策 | Decision Accuracy、Macro-F1、混淆矩阵 | 该直答、澄清、拒绝还是委派 |
+| 单 Agent 路由 | Top-1、Macro-F1、Top-K Recall | 是否选对专业 Agent |
+| 多 Agent 路由 | Agent Precision/Recall/F1、Jaccard、Exact Set Match | 是否漏调或乱调 Agent |
+| 澄清/拒识 | Clarification P/R、Out-of-Scope Recall、误接受率 | 不确定时是否乱猜，越权时是否拦截 |
+| Handoff | Required Slot Recall、Slot Value Accuracy、约束保留率 | Agent 选对但任务参数是否传错/传漏 |
+| 轨迹 | 必要/禁止调用、偏序满足、重复/循环率 | 拆分和调用顺序是否合理 |
+| 结果 | Task Success、`P(Success | Route Correct)` | 区分 Supervisor 错误与子 Agent 错误 |
+
+现有 `tool_sequence_match` 只是 candidate 与 baseline 工具名序列的 LCS，不能代表路由准确率：Baseline 也可能错，正确路径也可能不唯一，而且它不检查 `subagent_type`、Handoff 参数、澄清和最终状态。应新增确定性的 `supervisor_decision/supervisor_route/delegation_argument/trajectory_constraint/task_outcome` scorer；语义保真等无法规则化的部分再用经过人工校准的 custom scorer skill。完整 Case、评分时点、配置示例和线上看板见 [机制篇：Supervisor 的意图识别评测](../01-机制原理/05-机制篇-Agent评测与评测体系.md#56-多-agent-特有评测supervisor-的意图识别不能只看分类-accuracy)。
+
+**90 秒面试回答**：
+
+> Supervisor 不是一个普通单标签分类器，它要决定直答、澄清、拒绝还是委派，还可能拆成多个子任务。因此我不会只看总体 Accuracy，而会分层评估：决策层看 Macro-F1 和混淆矩阵；单路由看 Top-1，多路由看 Agent Precision/Recall/F1；Handoff 看租户、资源和时间范围等 slot 是否传全传对；轨迹看必要、可选、禁止 Agent 与偏序约束；最后看 Task Success 和路由正确条件下的成功率。第一步 Tool Call 出来就评 Supervisor 决策，完整 ReAct 结束后再评轨迹和业务结果。Case 主要从生产 Trace、能力边界、线上失败和对抗改写中来，人工确认 Gold；每个线上误路由都沉淀为回归样本。TCUM 当前只有工具序列 LCS，下一步应补结构化 route trace 和确定性 route scorer，把路由问题和子 Agent 能力问题真正拆开。
 
 ---
 
